@@ -14,9 +14,11 @@
 #
 # Subcommands:
 #
-#   remap [--apply] [--base <ref>] <map-file> <branch>
+#   remap [--apply | --check] [--base <ref>] <map-file> <branch>
 #       Locate each commit in <base>..<branch> by its message and move (or,
 #       without --apply, just print) each PR branch onto its matching commit.
+#       With --check nothing is printed as a plan and nothing moves: the exit
+#       status reports whether every branch already sits where the map says.
 #       Use this after rebasing the stack to snap the PR branches back onto
 #       their commits. Each substring must match exactly one commit or the
 #       command aborts without touching any branch. A branch checked out in
@@ -62,10 +64,11 @@ usage() {
 Usage: pr-stack.sh <command> [options] <map-file> [args]
 
 Commands:
-  remap [--apply] [--base <ref>] <map-file> [<branch>]
+  remap [--apply | --check] [--base <ref>] <map-file> [<branch>]
         Move each PR branch onto the commit whose subject matches its map
         pattern in <base>..<branch> (default base: main, branch: current).
-        Without --apply, only prints the plan (dry run).
+        Without --apply, only prints the plan (dry run). With --check, exits
+        nonzero unless every branch is already on its matched commit.
 
   push [--remote <name>] [--no-force] [--dry-run] <map-file>
         Push every branch in the map to <remote> (default: origin) as-is.
@@ -126,11 +129,12 @@ parse_map_file() {
 }
 
 cmd_remap() {
-	local base="main" apply=0
+	local base="main" apply=0 check=0
 	local positional=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--apply) apply=1; shift ;;
+		--check) check=1; shift ;;
 		--base) base="${2:-}"; [[ -n "$base" ]] || die "--base requires a value"; shift 2 ;;
 		-h | --help) usage 0 ;;
 		--) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done ;;
@@ -138,6 +142,7 @@ cmd_remap() {
 		*) positional+=("$1"); shift ;;
 		esac
 	done
+	[[ "$apply" -eq 0 || "$check" -eq 0 ]] || die "--check and --apply are mutually exclusive"
 	[[ ${#positional[@]} -ge 1 && ${#positional[@]} -le 2 ]] || usage 1
 	local map_file="${positional[0]}"
 	local branch="${positional[1]:-$(current_branch)}"
@@ -203,6 +208,26 @@ cmd_remap() {
 		fi
 	done
 	[[ "$errors" -eq 0 ]] || die "aborting: checked-out branch(es) would need to move (no branches were moved)"
+
+	# --check: report whether every branch already sits on its matched commit,
+	# without moving anything. Exit status is the answer.
+	if [[ "$check" -eq 1 ]]; then
+		local stale=()
+		for i in "${!MAP_BRANCHES[@]}"; do
+			if ! git show-ref --verify --quiet "refs/heads/${MAP_BRANCHES[$i]}"; then
+				stale+=("${MAP_BRANCHES[$i]}: missing locally, expected ${plan_hashes[$i]:0:12}")
+			elif [[ "$(git rev-parse "refs/heads/${MAP_BRANCHES[$i]}")" != "${plan_hashes[$i]}" ]]; then
+				stale+=("${MAP_BRANCHES[$i]}: at $(git rev-parse --short=12 "refs/heads/${MAP_BRANCHES[$i]}"), expected ${plan_hashes[$i]:0:12}  (${plan_subjects[$i]})")
+			fi
+		done
+		if [[ ${#stale[@]} -gt 0 ]]; then
+			printf 'error: %d branch(es) are not on their mapped commit in %s:\n' "${#stale[@]}" "$range" >&2
+			printf '         %s\n' "${stale[@]}" >&2
+			die "aborting: run 'remap --apply' to fix"
+		fi
+		printf 'All %d mapped branch(es) are on their matched commits in %s.\n' "${#MAP_BRANCHES[@]}" "$range"
+		return 0
+	fi
 
 	printf 'Remap plan for stack %s (base %s):\n\n' "$branch" "$base"
 	for i in "${!MAP_BRANCHES[@]}"; do
