@@ -32,6 +32,13 @@
 #       that points at it (using the commit subject as the pattern). Handy
 #       for snapshotting a stack you built by hand before a rebase.
 #
+#   advance [--remote <name>] [--base <branch>] <map-file>
+#       Fast-forward the local base branch from the remote, then comment out
+#       every map entry whose branch has landed in the base: either its tip
+#       is an ancestor of the base (merge commit / fast-forward), or its
+#       pattern matches a commit subject in the newly pulled range (rebase
+#       or squash merges, where hashes are rewritten but subjects survive).
+#
 set -euo pipefail
 
 die() {
@@ -67,6 +74,11 @@ Commands:
         <base>..<branch> (default branch: current), record any local branch
         whose tip is that commit, using the commit subject as its pattern.
         Writes to <file> or stdout.
+
+  advance [--remote <name>] [--base <branch>] <map-file>
+        Fast-forward local <base> (default: main) from <remote> (default:
+        origin), then comment out map entries whose branches are now part
+        of <base> (by ancestry, or by subject match in the pulled range).
 
 Map file: one entry per line, "<branch-name>  <commit message substring>".
 Blank lines and "#" comments are ignored.
@@ -297,6 +309,99 @@ cmd_capture() {
 	fi
 }
 
+cmd_advance() {
+	local base="main" remote="origin"
+	local positional=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--remote) remote="${2:-}"; [[ -n "$remote" ]] || die "--remote requires a value"; shift 2 ;;
+		--base) base="${2:-}"; [[ -n "$base" ]] || die "--base requires a value"; shift 2 ;;
+		-h | --help) usage 0 ;;
+		--) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done ;;
+		-*) die "unknown option: $1" ;;
+		*) positional+=("$1"); shift ;;
+		esac
+	done
+	[[ ${#positional[@]} -eq 1 ]] || usage 1
+	local map_file="${positional[0]}"
+	[[ -f "$map_file" ]] || die "map file not found: $map_file"
+
+	git show-ref --verify --quiet "refs/heads/$base" || die "base branch not found locally: $base"
+
+	local old_tip
+	old_tip="$(git rev-parse "refs/heads/$base")"
+
+	# Bring the base up to date. Both paths are fast-forward-only: pull when the
+	# base is checked out, an in-place fetch otherwise (refuses non-ff updates).
+	local head_branch
+	head_branch="$(git symbolic-ref --short -q HEAD || true)"
+	if [[ "$head_branch" == "$base" ]]; then
+		git pull --ff-only "$remote" "$base" ||
+			die "could not fast-forward $base from $remote (diverged or fetch failed)"
+	else
+		git fetch "$remote" "$base:$base" ||
+			die "could not fast-forward $base from $remote (diverged or fetch failed)"
+	fi
+
+	local new_tip
+	new_tip="$(git rev-parse "refs/heads/$base")"
+	if [[ "$old_tip" == "$new_tip" ]]; then
+		printf '%s is up to date at %s.\n' "$base" "${new_tip:0:12}"
+	else
+		printf 'Advanced %s: %s -> %s\n' "$base" "${old_tip:0:12}" "${new_tip:0:12}"
+	fi
+
+	# Subjects of the commits that just arrived, for matching rebase/squash
+	# merges whose branch tips are not ancestors of the base.
+	local new_subjects=""
+	[[ "$old_tip" != "$new_tip" ]] && new_subjects="$(git log --format='%s' "$old_tip..$new_tip")"
+
+	# Rewrite the map: comment out entries whose branch has landed in the base.
+	local nl=$'\n' buf="" merged_branches=()
+	local line stripped pr_branch pattern lineno=0 merged
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		lineno=$((lineno + 1))
+
+		stripped="${line%%#*}"
+		stripped="${stripped#"${stripped%%[![:space:]]*}"}" # ltrim
+		stripped="${stripped%"${stripped##*[![:space:]]}"}" # rtrim
+		if [[ -z "$stripped" ]]; then
+			buf+="${line}${nl}"
+			continue
+		fi
+
+		pr_branch="${stripped%%[[:space:]]*}"
+		pattern="${stripped#"$pr_branch"}"
+		pattern="${pattern#"${pattern%%[![:space:]]*}"}" # ltrim
+		[[ -n "$pattern" ]] || die "$map_file:$lineno: no commit message pattern for branch $pr_branch"
+
+		merged=0
+		if git show-ref --verify --quiet "refs/heads/$pr_branch" &&
+			git merge-base --is-ancestor "$pr_branch" "refs/heads/$base"; then
+			merged=1
+		elif [[ -n "$new_subjects" ]] &&
+			printf '%s\n' "$new_subjects" | awk -v p="$pattern" 'index($0, p) { found = 1 } END { exit !found }'; then
+			merged=1
+		fi
+
+		if [[ "$merged" -eq 1 ]]; then
+			buf+="# [merged] ${line}${nl}"
+			merged_branches+=("$pr_branch")
+		else
+			buf+="${line}${nl}"
+		fi
+	done <"$map_file"
+
+	if [[ ${#merged_branches[@]} -eq 0 ]]; then
+		printf 'No map entries are merged into %s; %s left untouched.\n' "$base" "$map_file"
+		return 0
+	fi
+
+	printf '%s' "$buf" >"$map_file"
+	printf 'Commented out %d merged branch(es) in %s:\n' "${#merged_branches[@]}" "$map_file"
+	printf '  %s\n' "${merged_branches[@]}"
+}
+
 [[ $# -gt 0 ]] || usage 1
 command="$1"
 shift
@@ -304,6 +409,7 @@ case "$command" in
 remap) cmd_remap "$@" ;;
 push) cmd_push "$@" ;;
 capture) cmd_capture "$@" ;;
+advance) cmd_advance "$@" ;;
 -h | --help) usage 0 ;;
-*) die "unknown command: $command (expected 'remap', 'push', or 'capture')" ;;
+*) die "unknown command: $command (expected 'remap', 'push', 'capture', or 'advance')" ;;
 esac
