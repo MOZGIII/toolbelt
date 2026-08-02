@@ -19,18 +19,21 @@
 #       without --apply, just print) each PR branch onto its matching commit.
 #       Use this after rebasing the stack to snap the PR branches back onto
 #       their commits. Each substring must match exactly one commit or the
-#       command aborts without touching any branch.
+#       command aborts without touching any branch. A branch checked out in
+#       any worktree cannot be moved: it is skipped when it already sits on
+#       its matched commit, and aborts the whole remap otherwise.
 #
 #   push [--remote <name>] [--no-force] [--dry-run] <map-file>
 #       Push every branch named in the map to the remote, as-is (no
 #       remapping). Verifies all branches exist locally first and aborts if
 #       any are missing. Uses --force-with-lease unless --no-force is given.
 #
-#   capture [--base <ref>] [--output <file>] <branch>
+#   capture [--base <ref>] [--output <file>] [--include-head] <branch>
 #       The inverse of remap: reconstruct a map file from an existing stack.
 #       Walks <base>..<branch> and, for each commit, records any local branch
 #       that points at it (using the commit subject as the pattern). Handy
-#       for snapshotting a stack you built by hand before a rebase.
+#       for snapshotting a stack you built by hand before a rebase. The
+#       stack head branch itself is excluded unless --include-head is given.
 #
 #   advance [--remote <name>] [--base <branch>] <map-file>
 #       Fast-forward the local base branch from the remote, then comment out
@@ -69,10 +72,11 @@ Commands:
         Verifies all branches exist locally first. Uses --force-with-lease
         unless --no-force is given.
 
-  capture [--base <ref>] [--output <file>] [<branch>]
+  capture [--base <ref>] [--output <file>] [--include-head] [<branch>]
         Build a map from an existing stack: for each commit in
         <base>..<branch> (default branch: current), record any local branch
         whose tip is that commit, using the commit subject as its pattern.
+        The head branch itself is excluded unless --include-head is given.
         Writes to <file> or stdout.
 
   advance [--remote <name>] [--base <branch>] <map-file>
@@ -177,9 +181,33 @@ cmd_remap() {
 
 	[[ "$errors" -eq 0 ]] || die "aborting: some patterns did not match exactly one commit (no branches were moved)"
 
+	# `git branch -f` refuses to move a branch checked out in any worktree.
+	# Tolerate such branches only when they already sit on their planned commit.
+	local checked_out
+	checked_out="$(git worktree list --porcelain |
+		awk '$1 == "branch" { sub("^refs/heads/", "", $2); print $2 }')"
+
+	local plan_skips=()
+	for i in "${!MAP_BRANCHES[@]}"; do
+		if printf '%s\n' "$checked_out" | grep -qxF "${MAP_BRANCHES[$i]}" &&
+			git show-ref --verify --quiet "refs/heads/${MAP_BRANCHES[$i]}"; then
+			if [[ "$(git rev-parse "refs/heads/${MAP_BRANCHES[$i]}")" == "${plan_hashes[$i]}" ]]; then
+				plan_skips+=(1)
+			else
+				printf 'error: branch %s is checked out and not on its matched commit %s\n' \
+					"${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}" >&2
+				errors=1; plan_skips+=(0)
+			fi
+		else
+			plan_skips+=(0)
+		fi
+	done
+	[[ "$errors" -eq 0 ]] || die "aborting: checked-out branch(es) would need to move (no branches were moved)"
+
 	printf 'Remap plan for stack %s (base %s):\n\n' "$branch" "$base"
 	for i in "${!MAP_BRANCHES[@]}"; do
-		printf '  %-48s -> %s  %s\n' "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}" "${plan_subjects[$i]}"
+		printf '  %-48s -> %s  %s%s\n' "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}" "${plan_subjects[$i]}" \
+			"$([[ "${plan_skips[$i]}" -eq 1 ]] && printf '  [checked out, already in place]')"
 	done
 	printf '\n'
 
@@ -188,11 +216,17 @@ cmd_remap() {
 		return 0
 	fi
 
+	local moved=0
 	for i in "${!MAP_BRANCHES[@]}"; do
+		if [[ "${plan_skips[$i]}" -eq 1 ]]; then
+			printf 'skipped %s (checked out, already at %s)\n' "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}"
+			continue
+		fi
 		git branch -f "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]}"
 		printf 'moved %s -> %s\n' "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}"
+		moved=$((moved + 1))
 	done
-	printf '\nDone. %d branch(es) remapped.\n' "${#MAP_BRANCHES[@]}"
+	printf '\nDone. %d branch(es) remapped.\n' "$moved"
 }
 
 cmd_push() {
@@ -246,11 +280,12 @@ cmd_push() {
 }
 
 cmd_capture() {
-	local base="main" output=""
+	local base="main" output="" include_head=0
 	local positional=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--base) base="${2:-}"; [[ -n "$base" ]] || die "--base requires a value"; shift 2 ;;
+		--include-head) include_head=1; shift ;;
 		-o | --output) output="${2:-}"; [[ -n "$output" ]] || die "--output requires a value"; shift 2 ;;
 		-h | --help) usage 0 ;;
 		--) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done ;;
@@ -264,8 +299,9 @@ cmd_capture() {
 	git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "base ref not found: $base"
 	git rev-parse --verify --quiet "$branch^{commit}" >/dev/null || die "branch not found: $branch"
 
-	# The stack branch itself (resolved to its name even if passed as HEAD) and
-	# the base are excluded from the captured keys.
+	# The base is always excluded from the captured keys; the stack branch
+	# itself (resolved to its name even if passed as HEAD) is excluded unless
+	# --include-head is given.
 	local self_name
 	self_name="$(git rev-parse --abbrev-ref "$branch")"
 
@@ -280,7 +316,8 @@ cmd_capture() {
 	while IFS=$'\t' read -r hash subject; do
 		while IFS= read -r b; do
 			[[ -n "$b" ]] || continue
-			[[ "$b" == "$self_name" || "$b" == "$base" ]] && continue
+			[[ "$b" == "$base" ]] && continue
+			[[ "$include_head" -eq 0 && "$b" == "$self_name" ]] && continue
 			cap_branches+=("$b")
 			cap_subjects+=("$subject")
 			[[ ${#b} -gt $width ]] && width=${#b}
@@ -295,7 +332,7 @@ cmd_capture() {
 	local buf="# PR stack map for ${self_name} (base ${base})${nl}"
 	buf+="#${nl}"
 	buf+="# Format: <branch-name>  <commit-subject>${nl}"
-	buf+="# Generated by scripts/pr-stack.sh capture.${nl}${nl}"
+	buf+="# Generated by pr-stack capture.${nl}${nl}"
 	local i
 	for i in "${!cap_branches[@]}"; do
 		buf+="$(printf '%-*s  %s' "$width" "${cap_branches[$i]}" "${cap_subjects[$i]}")${nl}"
