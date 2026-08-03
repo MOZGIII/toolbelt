@@ -41,7 +41,8 @@
 #         1. verify the local stack matches the map (pr-stack.sh remap --check)
 #            and that the PR branch matches its remote tip;
 #         2. retarget the PR onto <base> if it still points at a merged branch;
-#         3. wait until it is approved and CI is green;
+#         3. wait until it is approved, CI is green, and — with
+#            --require-local-review — a local review run says it is ready;
 #         4. merge via GitHub, wait for the merge to land;
 #         5. pr-stack.sh advance — pull <base>, comment the merged branch out
 #            of the map;
@@ -59,7 +60,17 @@
 #       while a reviewer approves and somebody fixes the build. An
 #       unapproved PR outranks a red build as the reported blocker, since
 #       it cannot merge either way. --no-wait-ci
-#       restores fail-fast behaviour for interactive use. The stack is
+#       restores fail-fast behaviour for interactive use.
+#
+#       --require-local-review adds a third gate, independent of the other
+#       two: the newest local review run for this PR (as written by
+#       pr-stack-review-claude.sh) must have concluded "true". It is not a
+#       GitHub review and neither substitutes for the other — a PR can be
+#       approved on GitHub having never been reviewed locally, or reviewed
+#       locally and never approved — so both are evaluated every round and
+#       reported together rather than one masking the other. Being part of
+#       the same wait, running the review in another terminal releases the
+#       train without restarting it. The stack is
 #       verified again after any such wait, because CI usually turns green
 #       by way of somebody pushing to the PR branch, which invalidates the
 #       earlier local-vs-remote check. A PR merged or closed by someone
@@ -181,7 +192,8 @@ Commands:
 
   merge-next [--base <branch>] [--stack <branch>] [--remote <name>]
              [--merge-method merge|squash|rebase] [--skip-ci | --no-wait-ci]
-             [--skip-approval] [--ci-interval <seconds>]
+             [--skip-approval] [--require-local-review] [--local-reviews-dir <path>]
+             [--ci-interval <seconds>]
              [--ci-retry-interval <seconds>] [--ci-timeout <seconds>]
              [--no-checks-timeout <seconds>] [--dry-run]
              <plan-file> <map-file>
@@ -195,6 +207,17 @@ Commands:
         re-verified before merging, since a fix usually arrives as a push
         to the PR branch.
 
+        --require-local-review
+                       also require a local review verdict of "true" for
+                       this PR, from the newest run under the reviews
+                       directory (as written by pr-stack-review-claude.sh:
+                       <pr>-<branch-slug>/latest/verdict). A missing,
+                       false or malformed verdict blocks the merge. Like
+                       the other gates this is waited on, not aborted at,
+                       so reviewing in another terminal releases the train.
+        --local-reviews-dir <path>
+                       where those reviews live (default:
+                       <repo-root>/.reviews). Implies --require-local-review.
         --skip-approval
                        merge without an approving review.
         --no-wait-ci   abort on the first red or missing CI result, or the
@@ -596,6 +619,52 @@ approval_blocker() {
 	esac
 }
 
+# review_slug <pr-number> <branch>
+#
+# The directory pr-stack-review-claude.sh files a branch's reviews under. Kept
+# in step with that script by hand: the two are separate tools and the layout
+# is the contract between them, so a change there needs a change here.
+review_slug() {
+	local number="$1" branch="$2" slug
+	slug="${branch//\//-}"
+	slug="${slug//[^A-Za-z0-9._-]/-}"
+	if [[ -n "$number" ]]; then
+		printf '%s-%s' "$number" "$slug"
+	else
+		printf '%s' "$slug"
+	fi
+}
+
+# local_review_blocker <pr-number> <branch> <reviews-dir>
+#
+# Prints why the local review does not clear this PR for merging, or nothing
+# when the newest run said "true". Only the latest run counts: an older pass
+# describes code that has since been rewritten, and re-reviewing is exactly
+# what a new run is for.
+#
+# A missing verdict is a blocker rather than a pass. That way the gate cannot
+# be satisfied by never having reviewed, and — since it is evaluated inside the
+# readiness wait — running the review in another terminal releases the train
+# without restarting it.
+local_review_blocker() {
+	local number="$1" branch="$2" dir="$3"
+	local verdict_file value
+	verdict_file="$dir/$(review_slug "$number" "$branch")/latest/verdict"
+
+	if [[ ! -f "$verdict_file" ]]; then
+		printf 'no local review verdict yet (expected %s)' "$verdict_file"
+		return 0
+	fi
+
+	value="$(tr -d '[:space:]' <"$verdict_file" | tr '[:upper:]' '[:lower:]')"
+	case "$value" in
+	true) ;;
+	false) printf 'the latest local review says this PR is not ready' ;;
+	"") printf 'local review verdict is empty (%s)' "$verdict_file" ;;
+	*) printf 'local review verdict is not true/false but "%s" (%s)' "$value" "$verdict_file" ;;
+	esac
+}
+
 # poll_checks <pr-number> [--required]
 #
 # One non-interactive look at a PR's checks. Prints "<state><TAB><summary>",
@@ -715,6 +784,7 @@ cmd_merge_next() {
 	local skip_ci=0 skip_approval=0 dry_run=0 ci_interval=30 merge_timeout=300
 	local wait_ci=1 ci_retry_interval=120 ci_timeout=0 no_checks_timeout=900
 	local required_only=""
+	local require_local_review=0 local_reviews_dir=""
 	local positional=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
@@ -732,6 +802,8 @@ cmd_merge_next() {
 		--required-only) required_only="--required"; shift ;;
 		--ignore-check) [[ -n "${2:-}" ]] || die "--ignore-check requires a value"; IGNORE_CHECKS+=("$2"); shift 2 ;;
 		--ignore-checks-file) [[ -n "${2:-}" ]] || die "--ignore-checks-file requires a value"; load_ignore_checks_file "$2"; shift 2 ;;
+		--require-local-review) require_local_review=1; shift ;;
+		--local-reviews-dir) local_reviews_dir="${2:-}"; [[ -n "$local_reviews_dir" ]] || die "--local-reviews-dir requires a value"; require_local_review=1; shift 2 ;;
 		--skip-ci) skip_ci=1; shift ;;
 		--skip-approval) skip_approval=1; shift ;;
 		--dry-run) dry_run=1; shift ;;
@@ -742,6 +814,9 @@ cmd_merge_next() {
 		esac
 	done
 	[[ ${#positional[@]} -eq 2 ]] || usage 1
+	if [[ "$require_local_review" -eq 1 && -z "$local_reviews_dir" ]]; then
+		local_reviews_dir="$(git rev-parse --show-toplevel)/.reviews"
+	fi
 	local plan_file="${positional[0]}" map_file="${positional[1]}"
 	[[ -f "$plan_file" ]] || die "plan file not found: $plan_file"
 	[[ -f "$map_file" ]] || die "map file not found: $map_file"
@@ -848,7 +923,7 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 
 		# --- readiness: approval + CI ------------------------------------
 		local ci_rounds=0
-		if [[ "$skip_ci" -eq 1 && "$skip_approval" -eq 1 ]]; then
+		if [[ "$skip_ci" -eq 1 && "$skip_approval" -eq 1 && "$require_local_review" -eq 0 ]]; then
 			step "Skipping the approval and CI waits (--skip-approval --skip-ci)"
 		else
 			step "Waiting for PR #$number to become mergeable"
@@ -875,13 +950,31 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 					;;
 				esac
 
-				blocker=""
+				# Two independent gates, evaluated separately and reported
+				# together. The local review is not a GitHub review and neither
+				# stands in for the other: a PR can be approved on GitHub with
+				# no local review run against it, or reviewed locally and never
+				# approved. Letting one short-circuit the other would hide
+				# whichever came second and turn a two-item fix list into two
+				# round trips.
+				local blockers=() local_blocker="" approval=""
+				if [[ "$require_local_review" -eq 1 ]]; then
+					local_blocker="$(local_review_blocker "$number" "$branch" "$local_reviews_dir")"
+					[[ -z "$local_blocker" ]] || blockers+=("local review: $local_blocker")
+				fi
 				if [[ "$skip_approval" -eq 0 ]]; then
 					if [[ -z "$pr_now" ]]; then
-						blocker="could not read the PR's review state"
+						approval="could not read the PR's review state"
 					else
-						blocker="$(approval_blocker "$pr_draft" "$pr_decision")"
+						approval="$(approval_blocker "$pr_draft" "$pr_decision")"
 					fi
+					[[ -z "$approval" ]] || blockers+=("GitHub approval: $approval")
+				fi
+
+				blocker=""
+				if [[ ${#blockers[@]} -gt 0 ]]; then
+					blocker="$(printf '%s; ' "${blockers[@]}")"
+					blocker="${blocker%; }"
 				fi
 
 				if [[ "$skip_ci" -eq 1 ]]; then
@@ -895,11 +988,10 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 				fi
 
 				if [[ -z "$blocker" && "$ci_state" == "green" ]]; then
-					if [[ "$skip_approval" -eq 1 ]]; then
-						note "checks are green ($summary)"
-					else
-						note "approved and checks are green ($summary)"
-					fi
+					local ready_desc="checks are green"
+					[[ "$skip_approval" -eq 0 ]] && ready_desc="approved and $ready_desc"
+					[[ "$require_local_review" -eq 1 ]] && ready_desc="locally reviewed, $ready_desc"
+					note "$ready_desc ($summary)"
 					break
 				fi
 
@@ -910,8 +1002,9 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 				if [[ -n "$blocker" ]]; then
 					[[ "$wait_ci" -eq 1 ]] ||
 						die_resumable "PR #$number is not ready to merge: $blocker" \
-							"Get it approved, then re-run — or drop --no-wait-ci to keep waiting.
-Use --skip-approval to merge without one."
+							"Clear the blocker(s) above, then re-run — or drop --no-wait-ci to keep waiting.
+Use --skip-approval to merge without a GitHub approval; drop
+--require-local-review to merge without a local review verdict."
 					if [[ "$ci_timeout" -gt 0 && "$waited_ci" -ge "$ci_timeout" ]]; then
 						die_resumable "PR #$number still not approved after ${waited_ci}s ($blocker)" \
 							"Get it approved, then re-run."
