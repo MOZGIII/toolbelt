@@ -40,7 +40,9 @@
 #   review.md    the review itself — Claude writes this file, the prompt tells
 #                it where;
 #   verdict      a machine-readable "true" or "false": is this PR ready to
-#                merge. Also written by Claude, also per the prompt.
+#                merge. Also written by Claude, also per the prompt;
+#   session-id   the Claude Code session this run used, so an interrupted run
+#                can be continued rather than repeated (see --resume).
 #
 # The latest run's verdict file doubles as the completion marker: a branch
 # whose newest run decided something is skipped unless --force is given, so a
@@ -174,6 +176,12 @@ Options (review, review-all):
   --timeout <seconds>  abort a single review after this long (0: no limit)
   --force              re-review branches whose latest run already decided,
                        as a new numbered run beside the old one
+  --resume             continue an interrupted run instead of starting over:
+                       when a branch's newest run has a session id but never
+                       reached a verdict, pick that Claude Code session up
+                       where it stopped, in the same run directory, with the
+                       transcript appended. Runs that finished are not
+                       resumable, and --force wins if both are given.
   --no-restore         stay on the last reviewed branch instead of going
                        back to the branch that was checked out at the start
   --dry-run            print the plan and the rendered prompt; run nothing
@@ -309,16 +317,18 @@ REVIEW_OUTPUT=""
 REVIEW_DEBUG=""
 REVIEW_MD=""
 REVIEW_VERDICT=""
+REVIEW_SESSION=""
 
 # set_run_files <run-dir>
 #
-# Points the four file globals at one run directory.
+# Points the file globals at one run directory.
 set_run_files() {
 	REVIEW_DIR="$1"
 	REVIEW_OUTPUT="$REVIEW_DIR/output.jsonl"
 	REVIEW_DEBUG="$REVIEW_DIR/debug.log"
 	REVIEW_MD="$REVIEW_DIR/review.md"
 	REVIEW_VERDICT="$REVIEW_DIR/verdict"
+	REVIEW_SESSION="$REVIEW_DIR/session-id"
 }
 
 # set_review_paths <output-dir> <pr-number> <branch>
@@ -361,6 +371,45 @@ plan_run_dir() {
 	mkdir -p "$dir"
 	# Relative target, so the whole tree can be moved or copied elsewhere.
 	ln -sfn "$(basename "$dir")" "$REVIEW_LATEST"
+}
+
+# new_session_id
+#
+# A UUID for `claude --session-id`. The id is chosen here, before the run
+# starts, rather than read back from the transcript afterwards: a review that
+# dies early — the very case resuming exists for — may never have emitted the
+# system/init event that carries it.
+new_session_id() {
+	if [[ -r /proc/sys/kernel/random/uuid ]]; then
+		cat /proc/sys/kernel/random/uuid
+	elif command -v uuidgen >/dev/null 2>&1; then
+		uuidgen | tr '[:upper:]' '[:lower:]'
+	else
+		die "no way to generate a UUID (need /proc/sys/kernel/random/uuid or uuidgen)"
+	fi
+}
+
+# find_resumable_run
+#
+# Points the file globals at the branch's newest run when that run was cut
+# short and can be picked up again: it has a session id, and it never reached a
+# verdict. Returns nonzero when there is nothing to resume, leaving the globals
+# where set_review_paths left them.
+#
+# An interrupted run is exactly the one worth continuing rather than repeating:
+# the transcript holds however far the review got, and Claude Code keeps the
+# session, so resuming carries the reasoning over instead of paying for it
+# twice. A finished run is never resumable — it has its verdict, and asking for
+# another opinion is a new run.
+find_resumable_run() {
+	[[ -L "$REVIEW_LATEST" || -d "$REVIEW_LATEST" ]] || return 1
+	local candidate="$REVIEW_LATEST"
+	[[ -s "$candidate/session-id" ]] || return 1
+	local verdict
+	verdict="$(read_verdict "$candidate/verdict")"
+	[[ "$verdict" != "true" && "$verdict" != "false" ]] || return 1
+	set_run_files "$candidate"
+	return 0
 }
 
 # count_runs
@@ -477,6 +526,26 @@ render_prompt() {
 	printf '%s' "$text"
 }
 
+# render_resume_prompt <review-file> <verdict-file>
+#
+# What a resumed session is told. Deliberately short: the session already
+# carries the original prompt and whatever the review had worked out before it
+# was cut off, so repeating the instructions would only invite a restart. All
+# this has to do is point at the finish line again.
+render_resume_prompt() {
+	local review="$1" verdict="$2"
+	cat <<EOF
+Your previous session was interrupted before it finished. Continue the code
+review from where it stopped — keep whatever you had already established rather
+than starting over, and redo only what the interruption left unfinished.
+
+Finish by writing both files, as originally instructed:
+
+1. \`$review\` — the review.
+2. \`$verdict\` — a single word, \`true\` or \`false\`, nothing else.
+EOF
+}
+
 # Defaults for the claude invocation, overridable per run.
 #
 # The allowlist has to cover everything a review prompt legitimately does: read
@@ -574,18 +643,33 @@ run_review() {
 	# to be rendered against this run's paths, hence the naming comes first.
 	local previous
 	previous="$(count_runs)"
-	plan_run_dir 0
+	# Resuming reuses the interrupted run's directory and session; anything else
+	# starts a numbered run of its own.
+	local resuming=0
+	if [[ "$RESUME" -eq 1 && "$FORCE" -eq 0 ]] && find_resumable_run; then
+		resuming=1
+	else
+		plan_run_dir 0
+	fi
 
 	local prompt
-	prompt="$(render_prompt "$prompt_file" "$branch" "$base" "$pr" "$title" \
-		"$root" "$REVIEW_MD" "$REVIEW_VERDICT")"
+	if [[ "$resuming" -eq 1 ]]; then
+		prompt="$(render_resume_prompt "$REVIEW_MD" "$REVIEW_VERDICT")"
+	else
+		prompt="$(render_prompt "$prompt_file" "$branch" "$base" "$pr" "$title" \
+			"$root" "$REVIEW_MD" "$REVIEW_VERDICT")"
+	fi
 
 	local commits
 	commits="$(git rev-list --count "$base..$branch")"
 	note "range  $base..$branch ($commits commit(s))"
-	local kept=""
-	[[ "$previous" -gt 0 ]] && kept=" ($previous earlier run(s) kept)"
-	note "output $REVIEW_DIR/$kept"
+	if [[ "$resuming" -eq 1 ]]; then
+		note "resume $REVIEW_DIR/ (session $(<"$REVIEW_SESSION"))"
+	else
+		local kept=""
+		[[ "$previous" -gt 0 ]] && kept=" ($previous earlier run(s) kept)"
+		note "output $REVIEW_DIR/$kept"
+	fi
 
 	if [[ "$DRY_RUN" -eq 1 ]]; then
 		printf '\n--- prompt ---\n%s\n--- end prompt ---\n' "$prompt"
@@ -594,7 +678,14 @@ run_review() {
 
 	git checkout --quiet "$branch" || die "could not check out $branch"
 
-	plan_run_dir 1
+	local session_id
+	if [[ "$resuming" -eq 1 ]]; then
+		session_id="$(<"$REVIEW_SESSION")"
+	else
+		plan_run_dir 1
+		session_id="$(new_session_id)"
+		printf '%s' "$session_id" >"$REVIEW_SESSION"
+	fi
 
 	# stream-json (which -p only allows with --verbose) is what makes
 	# output.jsonl a real transcript rather than a closing summary: one event
@@ -604,6 +695,14 @@ run_review() {
 		--permission-mode "$PERMISSION_MODE"
 		--debug-file "$REVIEW_DEBUG"
 	)
+	# --session-id names the session so it can be found again; --resume picks
+	# that same session up. Session persistence is what makes either work, so
+	# --no-session-persistence must never be added here.
+	if [[ "$resuming" -eq 1 ]]; then
+		claude_cmd+=(--resume "$session_id")
+	else
+		claude_cmd+=(--session-id "$session_id")
+	fi
 	[[ -n "$MODEL" ]] && claude_cmd+=(--model "$MODEL")
 	[[ -n "$EFFORT" ]] && claude_cmd+=(--effort "$EFFORT")
 	[[ "$TOOL_LIMITS" -eq 1 ]] && claude_cmd+=(--allowed-tools "${ALLOWED_TOOLS[@]}")
@@ -613,7 +712,11 @@ run_review() {
 
 	tick "running claude"
 	local rc=0
-	printf '%s' "$prompt" | "${claude_cmd[@]}" | tee "$REVIEW_OUTPUT" | format_stream || rc=$?
+	# Append on resume: the interrupted attempt's events stay, the continuation
+	# follows them, and the file remains one transcript of how this run went.
+	local -a capture=(tee "$REVIEW_OUTPUT")
+	[[ "$resuming" -eq 1 ]] && capture=(tee -a "$REVIEW_OUTPUT")
+	printf '%s' "$prompt" | "${claude_cmd[@]}" | "${capture[@]}" | format_stream || rc=$?
 	if [[ "$rc" -ne 0 ]]; then
 		printf 'error: claude exited %s for %s (transcript in %s)\n' "$rc" "$branch" "$REVIEW_OUTPUT" >&2
 		return 1
@@ -653,6 +756,7 @@ run_review() {
 OUTPUT_DIR=""
 PROMPT_FILE="$PROMPT_FILE_DEFAULT"
 FORCE=0
+RESUME=0
 ALLOW_OVERRIDDEN=0
 
 # parse_common_opt <arg> [value...]
@@ -707,6 +811,10 @@ parse_common_opt() {
 		;;
 	--force)
 		FORCE=1
+		OPT_CONSUMED=1
+		;;
+	--resume)
+		RESUME=1
 		OPT_CONSUMED=1
 		;;
 	--no-restore)
@@ -947,6 +1055,10 @@ cmd_status() {
 			state="merged"
 		elif review_is_done "$REVIEW_VERDICT"; then
 			state="$verdict"
+		elif [[ -s "$REVIEW_LATEST/session-id" ]]; then
+			# Started and never finished: --resume can pick this one up.
+			state="resumable"
+			pending=$((pending + 1))
 		else
 			# Missing and malformed alike: review-all will pick it up again.
 			state="${verdict:-pending}"
