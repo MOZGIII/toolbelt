@@ -12,8 +12,10 @@
 # trunk: in a chained stack every PR's base is the previous PR's branch, so
 # reviewing against the trunk would re-review everything underneath it. In
 # plan mode the parent is the preceding entry in the plan file (merged ones
-# included, since they are still the chain), and the bottom entry falls back
-# to the trunk. --base overrides it for a single branch.
+# included, since they are still the chain), and the bottom entry falls back to
+# the trunk (--trunk). That parent is not overridable: a review against some
+# other base is a different question, and review-standalone is where it is
+# asked.
 #
 # Each branch gets a directory under the output directory, named
 # "<pr-number>-<branch-slug>" so a listing sorts into merge order. Inside it,
@@ -63,9 +65,21 @@
 #
 # Subcommands:
 #
-#   review [options] <branch>
-#       Review one branch. --plan <file> looks the branch up in a plan file to
-#       pick up its PR number, title and parent.
+#   review [options] <plan-file> <branch>
+#       Review one branch, looked up in the plan for its PR number, title and
+#       parent. The plan is an argument because it is required, and it is
+#       required for more than lookup: a commit can have several branches on it
+#       and so several PRs, so "the PR for this branch" is not a question git
+#       can answer. The plan answers it by listing the PRs in the order they
+#       will be merged.
+#
+#   review-standalone [options] [--base <ref>] <branch>
+#       Review a branch that no plan covers — a spike, or a PR not in the merge
+#       order yet — against --base (default: main). Its own command rather
+#       than a flag on `review`, because it cannot answer what `review` answers:
+#       there is no PR number, and the base is asserted rather than derived. Its
+#       run directories and session names are shaped accordingly, and the merge
+#       gate does not look for them, since nothing here claims to review a PR.
 #
 #   review-all [options] <plan-file>
 #       Review every active entry in the plan, bottom first, skipping the ones
@@ -125,11 +139,23 @@ usage() {
 Usage: pr-stack-review-claude.sh <command> [options] [args]
 
 Commands:
-  review [options] [--plan <file>] [--base <branch>] <branch>
-        Review one branch against its parent. Without --plan the parent is
-        --base (default: the trunk) and the output files are named after
-        the branch alone; with --plan the PR number, title and parent
-        branch come from the plan file.
+  review [options] <plan-file> <branch>
+        Review one branch against its parent, taking its PR number, title
+        and parent from the plan. The plan is an argument, not an option,
+        because it is required: a commit can carry several branches and so
+        several PRs, and what settles which one is under review — and what
+        it is reviewed against — is the plan listing it in merge order.
+        There is deliberately no --base: reviewing against anything else is
+        review-standalone's job, and filing that answer under the PR would
+        let it satisfy the merge gate.
+
+  review-standalone [options] [--base <ref>] <branch>
+        Review a branch no plan covers — a spike, or a PR not in the merge
+        order yet — against --base (default: main). Separate from
+        `review` because it cannot answer what `review` answers: there is
+        no PR number, and the base is asserted rather than derived. Its run
+        directories and session names are shaped accordingly, and the merge
+        script's --require-local-review gate does not look for them.
 
   review-all [options] [--max <n>] [--keep-going] <plan-file>
         Review every not-yet-reviewed active entry in the plan, bottom
@@ -142,9 +168,9 @@ Commands:
   status [--output-dir <dir>] <plan-file>
         Print each plan entry with its review state and verdict.
 
-Options (review, review-all):
-  --trunk <branch>     what the bottom plan entry is reviewed against
-                       (default: main)
+Options (all review commands):
+  --trunk <branch>     review, review-all only: what the bottom plan entry
+                       is reviewed against (default: main)
   --output-dir <dir>   where the per-branch review directories go
                        (default: <repo-root>/.reviews). Each holds one
                        numbered directory per run (001, 002, …) plus a
@@ -526,6 +552,30 @@ render_prompt() {
 	printf '%s' "$text"
 }
 
+# session_name <pr-number> <branch>
+#
+# The display name Claude Code shows for this run's session in the /resume
+# picker and the terminal title:
+#
+#     review pr=497 branch=mzg/2026-07-23/update-smoke-test run=001
+#     review-standalone branch=mzg/wip/spike base=main run=001
+#
+# Within a command every field is always present, in the same order, labelled.
+# The two commands name themselves differently because they are describing
+# different things: a plan review is identified by its PR, a standalone one has
+# no PR to be identified by and is only meaningful alongside the base it was
+# read against. The leading word says which you are looking at, so neither
+# reads as a broken version of the other.
+session_name() {
+	local pr="$1" branch="$2" base="$3" run
+	run="$(basename "$REVIEW_DIR")"
+	if [[ "$REVIEW_KIND" == "standalone" ]]; then
+		printf 'review-standalone branch=%s base=%s run=%s' "$branch" "$base" "$run"
+	else
+		printf 'review pr=%s branch=%s run=%s' "$pr" "$branch" "$run"
+	fi
+}
+
 # render_resume_prompt <review-file> <verdict-file>
 #
 # What a resumed session is told. Deliberately short: the session already
@@ -698,10 +748,16 @@ run_review() {
 	# --session-id names the session so it can be found again; --resume picks
 	# that same session up. Session persistence is what makes either work, so
 	# --no-session-persistence must never be added here.
+	#
+	# A display name comes with it, because these sessions land in the same
+	# /resume list as the interactive ones for this repo and a screenful of
+	# untitled entries is a screenful you have to open to identify. It is set
+	# only when the session is created: a resumed run is the same session and
+	# keeps the name it was given.
 	if [[ "$resuming" -eq 1 ]]; then
 		claude_cmd+=(--resume "$session_id")
 	else
-		claude_cmd+=(--session-id "$session_id")
+		claude_cmd+=(--session-id "$session_id" --name "$(session_name "$pr" "$branch" "$base")")
 	fi
 	[[ -n "$MODEL" ]] && claude_cmd+=(--model "$MODEL")
 	[[ -n "$EFFORT" ]] && claude_cmd+=(--effort "$EFFORT")
@@ -757,6 +813,9 @@ OUTPUT_DIR=""
 PROMPT_FILE="$PROMPT_FILE_DEFAULT"
 FORCE=0
 RESUME=0
+# Which command is running: "plan" (review / review-all) or "standalone".
+# Only the naming and the progress line differ; the machinery does not.
+REVIEW_KIND="plan"
 ALLOW_OVERRIDDEN=0
 
 # parse_common_opt <arg> [value...]
@@ -839,26 +898,97 @@ resolve_output_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# review
+# review / review-standalone
 # ---------------------------------------------------------------------------
 
+# start_review <branch> <base> <pr> <title>
+#
+# Everything the two single-branch commands do once they know what they are
+# reviewing and what against. They differ only in how they answer that — from a
+# plan, or from arguments — so that is all either one contains.
+start_review() {
+	local branch="$1" base="$2" pr="$3" title="$4"
+
+	local root
+	root="$(git rev-parse --show-toplevel)"
+	resolve_output_dir "$root"
+	set_review_paths "$OUTPUT_DIR" "$pr" "$branch"
+
+	if [[ "$FORCE" -eq 0 && "$DRY_RUN" -eq 0 ]] && review_is_done "$REVIEW_VERDICT"; then
+		die "already reviewed: $REVIEW_VERDICT says $(read_verdict "$REVIEW_VERDICT") (--force to redo)"
+	fi
+
+	if [[ "$REVIEW_KIND" == "standalone" ]]; then
+		step "Reviewing $branch against $base (standalone)"
+	else
+		step "Reviewing #$pr $branch"
+	fi
+	run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE"
+}
+
 cmd_review() {
-	local plan_file="" base="" trunk="main" branch=""
+	local trunk="main" positional=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--plan)
-			plan_file="${2:-}"
-			[[ -n "$plan_file" ]] || die "--plan requires a value"
-			shift 2
-			;;
-		--base)
-			base="${2:-}"
-			[[ -n "$base" ]] || die "--base requires a value"
-			shift 2
-			;;
 		--trunk)
 			trunk="${2:-}"
 			[[ -n "$trunk" ]] || die "--trunk requires a value"
+			shift 2
+			;;
+		--*)
+			parse_common_opt "$@"
+			[[ "$OPT_CONSUMED" -gt 0 ]] || die "unknown option: $1"
+			shift "$OPT_CONSUMED"
+			;;
+		*)
+			positional+=("$1")
+			shift
+			;;
+		esac
+	done
+	# The plan is not a convenience here, it is the only thing that answers
+	# "which PR is this?". A commit can carry several branches and so several
+	# PRs; what makes one of them the answer is that the plan lists it, in the
+	# order it will be merged. Without that there is no PR number, no parent to
+	# review against, and nothing the merge gate can look up — so it is an
+	# argument, not an option.
+	[[ ${#positional[@]} -eq 2 ]] || usage 1
+	local plan_file="${positional[0]}" branch="${positional[1]}"
+
+	require_tools
+	claim_worktree
+
+	parse_plan_file "$plan_file"
+	local idx
+	idx="$(plan_index_of "$branch")" ||
+		die "branch not listed in $plan_file: $branch"
+	local pr="${PLAN_NUMBERS[$idx]}" title="${PLAN_TITLES[$idx]}"
+	# The parent, and only the parent: reviewing against another base is
+	# review-standalone's question, and answering it under this PR's directory
+	# would let it satisfy the merge gate.
+	local base
+	base="$(plan_parent_of "$idx" "$trunk")"
+
+	start_review "$branch" "$base" "$pr" "$title"
+}
+
+# review-standalone
+#
+# The plan-less review, kept because it is genuinely useful — a branch with no
+# PR yet, or one whose plan entry does not exist — and kept separate because it
+# cannot answer the questions `review` answers. There is no PR number, and the
+# base is whatever you say it is rather than the branch below it in the merge
+# order. Its artifacts are shaped differently for the same reason, and the
+# merge gate will not find them: nothing here claims to be a review of a PR.
+cmd_review_standalone() {
+	# No --trunk here: with no plan there is no bottom entry to fall back for,
+	# so the trunk would only ever be a second way of spelling --base.
+	local base="main" branch=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--base)
+			base="${2:-}"
+			[[ -n "$base" ]] || die "--base requires a value"
 			shift 2
 			;;
 		--*)
@@ -878,30 +1008,8 @@ cmd_review() {
 	require_tools
 	claim_worktree
 
-	local root
-	root="$(git rev-parse --show-toplevel)"
-	resolve_output_dir "$root"
-
-	local pr="" title=""
-	if [[ -n "$plan_file" ]]; then
-		parse_plan_file "$plan_file"
-		local idx
-		idx="$(plan_index_of "$branch")" ||
-			die "branch not listed in $plan_file: $branch"
-		pr="${PLAN_NUMBERS[$idx]}"
-		title="${PLAN_TITLES[$idx]}"
-		[[ -n "$base" ]] || base="$(plan_parent_of "$idx" "$trunk")"
-	fi
-	[[ -n "$base" ]] || base="$trunk"
-
-	set_review_paths "$OUTPUT_DIR" "$pr" "$branch"
-
-	if [[ "$FORCE" -eq 0 && "$DRY_RUN" -eq 0 ]] && review_is_done "$REVIEW_VERDICT"; then
-		die "already reviewed: $REVIEW_VERDICT says $(read_verdict "$REVIEW_VERDICT") (--force to redo)"
-	fi
-
-	step "Reviewing ${pr:+#$pr }$branch"
-	run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE"
+	REVIEW_KIND="standalone"
+	start_review "$branch" "$base" "" ""
 }
 
 # ---------------------------------------------------------------------------
@@ -1076,8 +1184,9 @@ command="$1"
 shift
 case "$command" in
 review) cmd_review "$@" ;;
+review-standalone) cmd_review_standalone "$@" ;;
 review-all) cmd_review_all "$@" ;;
 status) cmd_status "$@" ;;
 -h | --help) usage 0 ;;
-*) die "unknown command: $command (expected 'review', 'review-all', or 'status')" ;;
+*) die "unknown command: $command (expected 'review', 'review-standalone', 'review-all', or 'status')" ;;
 esac
