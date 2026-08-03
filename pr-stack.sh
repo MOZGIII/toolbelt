@@ -87,6 +87,35 @@ Commands:
         origin), then comment out map entries whose branches are now part
         of <base> (by ancestry, or by subject match in the pulled range).
 
+  rebase [--base <ref>] [--branch <b>] [--map <file>] [--exec <cmd>]
+         [--no-edit] [--dry-run]
+        Rebase the stack onto <base> with --update-refs, so every PR branch
+        in the range is carried along instead of being left behind. The todo
+        opens in your editor as any interactive rebase would — with the exec
+        lines already injected, so what you review is what will run, and you
+        can reorder, drop or edit any of it. Quitting the editor with an
+        error calls the rebase off. --no-edit skips the review, for
+        unattended runs (and is required when there is no terminal).
+
+        With --exec (-x), the command additionally runs once per PR rather
+        than once per commit, as "git rebase --exec" would: only at each PR
+        tip. It goes through the same interactive rebase either way — this
+        script only supplies the todo list, so git does the walking, the
+        stopping and the resuming. The command is told nothing about which
+        branch it is at, because a commit can carry several. Ask git for
+        them if you need them, with "git for-each-ref --points-at HEAD
+        refs/heads" — though that only answers while picks fast-forward;
+        rewritten commits have no branch on them until the rebase ends.
+
+        PR tips come from local branch tips in the range by default; pass
+        --map to take them from a map file instead, which is what you want
+        when branches have drifted off their commits. --dry-run prints the
+        plan without rebasing.
+
+        Commit hashes survive when the stack already sits on <base> (the
+        picks fast-forward); they are rewritten only when the rebase has
+        real work to do, as any rebase onto a moved base would.
+
 Map file: one entry per line, "<branch-name>  <commit message substring>".
 Blank lines and "#" comments are ignored.
 EOF
@@ -128,6 +157,54 @@ parse_map_file() {
 	[[ ${#MAP_BRANCHES[@]} -gt 0 ]] || die "no usable entries in map file: $map_file"
 }
 
+# resolve_map_commits <base> <branch>
+#
+# Matches every map pattern against the commit subjects in <base>..<branch> and
+# fills PLAN_HASHES / PLAN_SUBJECTS, parallel to MAP_BRANCHES. Each pattern must
+# match exactly one commit; anything else is reported and aborts, so callers can
+# assume a resolved plan or no plan at all. parse_map_file must have run first.
+PLAN_HASHES=()
+PLAN_SUBJECTS=()
+resolve_map_commits() {
+	local base="$1" branch="$2"
+
+	# Snapshot candidate commits once: "<hash><TAB><subject>" per line.
+	local range="$base..$branch"
+	local commits
+	commits="$(git log --reverse --format='%H%x09%s' "$range")"
+	[[ -n "$commits" ]] || die "no commits in range $range"
+
+	PLAN_HASHES=()
+	PLAN_SUBJECTS=()
+	local errors=0 i pattern matches count hash subject
+	for i in "${!MAP_BRANCHES[@]}"; do
+		pattern="${MAP_PATTERNS[$i]}"
+
+		# Literal substring match against subjects, case sensitive.
+		matches="$(printf '%s\n' "$commits" | awk -F'\t' -v p="$pattern" 'index($2, p) { print }')" || true
+		count=0
+		[[ -n "$matches" ]] && count="$(printf '%s\n' "$matches" | grep -c '')"
+
+		if [[ "$count" -eq 0 ]]; then
+			printf 'error: no commit in %s matches "%s" (branch %s)\n' "$range" "$pattern" "${MAP_BRANCHES[$i]}" >&2
+			errors=1; PLAN_HASHES+=("") PLAN_SUBJECTS+=(""); continue
+		fi
+		if [[ "$count" -gt 1 ]]; then
+			printf 'error: %d commits match "%s" (branch %s) — pattern is ambiguous:\n' "$count" "$pattern" "${MAP_BRANCHES[$i]}" >&2
+			printf '%s\n' "$matches" | sed 's/\t/  /;s/^/         /' >&2
+			errors=1; PLAN_HASHES+=("") PLAN_SUBJECTS+=(""); continue
+		fi
+
+		hash="${matches%%$'\t'*}"
+		subject="${matches#*$'\t'}"
+		PLAN_HASHES+=("$hash")
+		PLAN_SUBJECTS+=("$subject")
+	done
+
+	[[ "$errors" -eq 0 ]] || return 1
+	return 0
+}
+
 cmd_remap() {
 	local base="main" apply=0 check=0
 	local positional=()
@@ -152,39 +229,11 @@ cmd_remap() {
 
 	parse_map_file "$map_file"
 
-	# Snapshot candidate commits once: "<hash><TAB><subject>" per line.
 	local range="$base..$branch"
-	local commits
-	commits="$(git log --reverse --format='%H%x09%s' "$range")"
-	[[ -n "$commits" ]] || die "no commits in range $range"
-
-	local plan_hashes=() plan_subjects=()
-	local errors=0 i pattern matches count hash subject
-	for i in "${!MAP_BRANCHES[@]}"; do
-		pattern="${MAP_PATTERNS[$i]}"
-
-		# Literal substring match against subjects, case sensitive.
-		matches="$(printf '%s\n' "$commits" | awk -F'\t' -v p="$pattern" 'index($2, p) { print }')" || true
-		count=0
-		[[ -n "$matches" ]] && count="$(printf '%s\n' "$matches" | grep -c '')"
-
-		if [[ "$count" -eq 0 ]]; then
-			printf 'error: no commit in %s matches "%s" (branch %s)\n' "$range" "$pattern" "${MAP_BRANCHES[$i]}" >&2
-			errors=1; plan_hashes+=("") plan_subjects+=(""); continue
-		fi
-		if [[ "$count" -gt 1 ]]; then
-			printf 'error: %d commits match "%s" (branch %s) — pattern is ambiguous:\n' "$count" "$pattern" "${MAP_BRANCHES[$i]}" >&2
-			printf '%s\n' "$matches" | sed 's/\t/  /;s/^/         /' >&2
-			errors=1; plan_hashes+=("") plan_subjects+=(""); continue
-		fi
-
-		hash="${matches%%$'\t'*}"
-		subject="${matches#*$'\t'}"
-		plan_hashes+=("$hash")
-		plan_subjects+=("$subject")
-	done
-
-	[[ "$errors" -eq 0 ]] || die "aborting: some patterns did not match exactly one commit (no branches were moved)"
+	resolve_map_commits "$base" "$branch" ||
+		die "aborting: some patterns did not match exactly one commit (no branches were moved)"
+	local plan_hashes=("${PLAN_HASHES[@]}") plan_subjects=("${PLAN_SUBJECTS[@]}")
+	local errors=0 i
 
 	# `git branch -f` refuses to move a branch checked out in any worktree.
 	# Tolerate such branches only when they already sit on their planned commit.
@@ -252,6 +301,257 @@ cmd_remap() {
 		moved=$((moved + 1))
 	done
 	printf '\nDone. %d branch(es) remapped.\n' "$moved"
+}
+
+# ---------------------------------------------------------------------------
+# exec
+# ---------------------------------------------------------------------------
+
+# Absolute path to this script, so the rebase can call back into it as its
+# sequence editor.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# cmd_todo_edit <todo-file>
+#
+# The sequence editor half of `rebase`: git hands us the todo, we hand it back
+# with an `exec` line after each PR tip, then hand it on to the editor the user
+# would have got anyway. Not meant to be run by hand.
+#
+# Its inputs arrive through the environment rather than argv, because git
+# appends the todo path to whatever GIT_SEQUENCE_EDITOR says and an editor
+# command is itself a shell string — nesting one inside the other survives
+# neither quoting nor an editor with spaces in its path:
+#
+#   PR_STACK_SPEC     file of boundary commit hashes, one per line; empty for
+#                     a plain rebase with nothing to inject
+#   PR_STACK_COMMAND  the command to run at each of them
+#   PR_STACK_EDITOR   the real sequence editor; empty to skip editing
+#
+# Boundaries are commits, not branches, and the command is told nothing about
+# which refs happen to sit on one. A commit can carry any number of branches —
+# the stack head always shares its commit with the topmost PR branch — so there
+# is no "the branch for this commit" to hand over. A command that wants the
+# names asks git for them itself, where it sees all of them rather than one
+# picked for it:
+#
+#     -x 'git for-each-ref --points-at HEAD --format="%(refname:short)" refs/heads'
+#
+# With the caveat that this answers only while the rebase is fast-forwarding
+# picks it does not need to rewrite. Once commits are genuinely rewritten the
+# branches still point at their pre-rebase commits — --update-refs applies the
+# whole set at the end — so nothing points at HEAD yet and the query comes back
+# empty. Checking an already-based stack sees its refs; rebasing onto a moved
+# base does not.
+#
+# Todo lines name commits abbreviated, so each pick is resolved back to a full
+# hash before it is looked up — abbreviations are not stable enough to compare
+# as text.
+#
+# The exec goes immediately after its pick, ahead of any `update-ref` lines
+# --update-refs put there. Those lines do not move a branch when they are
+# reached: git only records the intended update and applies the whole set once
+# the rebase completes, so during the exec the PR branch still points at its
+# pre-rebase commit either way. With the ref values identical, the exec belongs
+# next to the commit it is about.
+cmd_todo_edit() {
+	local todo_file="$1"
+	local spec_file="${PR_STACK_SPEC:-}" editor="${PR_STACK_EDITOR:-}"
+	local command="${PR_STACK_COMMAND:-}"
+
+	if [[ -z "$spec_file" ]]; then
+		# Plain rebase: nothing to inject, straight on to the editor.
+		run_todo_editor "$editor" "$todo_file"
+		return $?
+	fi
+
+	local -A is_boundary=()
+	local hash line
+
+	while read -r hash; do
+		[[ -n "$hash" ]] || continue
+		is_boundary["$hash"]=1
+	done <"$spec_file"
+
+	local out="" nl=$'\n' verb rest full
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		out+="$line$nl"
+
+		verb="${line%%[[:space:]]*}"
+		[[ "$verb" == "pick" || "$verb" == "p" ]] || continue
+
+		rest="${line#"$verb"}"
+		rest="${rest#"${rest%%[![:space:]]*}"}"
+		full="$(git rev-parse --verify --quiet "${rest%%[[:space:]]*}^{commit}" || true)"
+		[[ -n "$full" && -n "${is_boundary[$full]:-}" ]] || continue
+
+		out+="exec $command$nl"
+	done <"$todo_file"
+
+	printf '%s' "$out" >"$todo_file"
+
+	# The user reviews the todo *after* the execs are in it, so what they
+	# approve is what actually runs — and they can still reorder, drop or edit
+	# any of it, exec lines included.
+	run_todo_editor "$editor" "$todo_file"
+}
+
+# run_todo_editor <editor> <todo-file>
+#
+# Hands the todo to the real sequence editor, the way git would have. An empty
+# editor means --no-edit: leave the file alone. A non-zero exit propagates, and
+# git treats that as "abort the rebase" — which makes quitting the editor with
+# an error the natural way to call the whole thing off.
+run_todo_editor() {
+	local editor="$1" todo_file="$2"
+	[[ -n "$editor" ]] || return 0
+	# "$editor" is a command line, not a program name, so it goes through a
+	# shell — same as git does it.
+	sh -c "$editor \"\$@\"" "$editor" "$todo_file"
+}
+
+# collect_boundaries <base> <branch> [<map-file>]
+#
+# Works out which commits in <base>..<branch> are PR tips, filling
+# BOUNDARY_LABEL_AT (hash -> branch name(s)) alongside RANGE_HASHES /
+# RANGE_SUBJECTS for the whole range in rebase order.
+#
+# With a map file the tips come from the map, which is the authority when
+# branches have drifted off their commits. Without one they come from git
+# itself: any local branch whose tip is a commit in the range is a PR tip. That
+# covers the ordinary case — a stack whose branches are where the map would put
+# them anyway — without asking for a file to say so. The stack head is included,
+# so a command also runs at the top of the stack.
+declare -A BOUNDARY_LABEL_AT=()
+RANGE_HASHES=()
+RANGE_SUBJECTS=()
+collect_boundaries() {
+	local base="$1" branch="$2" map_file="${3:-}"
+
+	BOUNDARY_LABEL_AT=()
+	RANGE_HASHES=()
+	RANGE_SUBJECTS=()
+
+	if [[ -n "$map_file" ]]; then
+		parse_map_file "$map_file"
+		resolve_map_commits "$base" "$branch" ||
+			die "aborting: some patterns did not match exactly one commit (nothing was rebased)"
+		local i
+		for i in "${!MAP_BRANCHES[@]}"; do
+			BOUNDARY_LABEL_AT["${PLAN_HASHES[$i]}"]="${MAP_BRANCHES[$i]}"
+		done
+	else
+		local hash name
+		while read -r hash name; do
+			[[ -n "$hash" ]] || continue
+			# Several branches can share a commit; keep them all, space
+			# separated, rather than picking a winner arbitrarily.
+			BOUNDARY_LABEL_AT["$hash"]="${BOUNDARY_LABEL_AT[$hash]:+${BOUNDARY_LABEL_AT[$hash]} }$name"
+		done < <(git for-each-ref --format='%(objectname) %(refname:short)' refs/heads)
+	fi
+
+	local hash subject
+	while IFS=$'\t' read -r hash subject; do
+		RANGE_HASHES+=("$hash")
+		RANGE_SUBJECTS+=("$subject")
+	done < <(git log --reverse --format='%H%x09%s' "$base..$branch")
+
+	[[ ${#RANGE_HASHES[@]} -gt 0 ]] || die "no commits in range $base..$branch"
+}
+
+cmd_rebase() {
+	local base="main" branch="" map_file="" command="" dry_run=0 no_edit=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--base) base="${2:-}"; [[ -n "$base" ]] || die "--base requires a value"; shift 2 ;;
+		--branch) branch="${2:-}"; [[ -n "$branch" ]] || die "--branch requires a value"; shift 2 ;;
+		--map) map_file="${2:-}"; [[ -n "$map_file" ]] || die "--map requires a value"; shift 2 ;;
+		--exec | -x) command="${2:-}"; [[ -n "$command" ]] || die "--exec requires a command"; shift 2 ;;
+		--no-edit) no_edit=1; shift ;;
+		--dry-run) dry_run=1; shift ;;
+		-h | --help) usage 0 ;;
+		-*) die "unknown option: $1" ;;
+		*) die "unexpected argument: $1 (the command goes in --exec)" ;;
+		esac
+	done
+
+	[[ "$command" != *$'\n'* ]] || die "--exec must be a single line (rebase todo entries are line-based)"
+
+	[[ -n "$branch" ]] || branch="$(current_branch)"
+	git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "base ref not found: $base"
+	git rev-parse --verify --quiet "$branch^{commit}" >/dev/null || die "branch not found: $branch"
+	[[ -z "$(git status --porcelain --untracked-files=no)" ]] ||
+		die "worktree has modified tracked files — rebase needs a clean tree"
+
+	collect_boundaries "$base" "$branch" "$map_file"
+
+	local spec=""
+	if [[ -n "$command" ]]; then
+		spec="$(mktemp)"
+		# shellcheck disable=SC2064  # $spec is expanded now on purpose.
+		trap "rm -f '$spec'" EXIT
+	fi
+
+	local source_desc="boundaries from branch tips in the range"
+	[[ -n "$map_file" ]] && source_desc="boundaries from $map_file"
+	printf 'Rebase plan for %s onto %s (%s):\n\n' "$branch" "$base" "$source_desc"
+
+	local i hash n=0
+	for i in "${!RANGE_HASHES[@]}"; do
+		hash="${RANGE_HASHES[$i]}"
+		printf '  %s  %s\n' "${hash:0:12}" "${RANGE_SUBJECTS[$i]}"
+		[[ -n "${BOUNDARY_LABEL_AT[$hash]:-}" ]] || continue
+		n=$((n + 1))
+		# The labels are here to show which PR a boundary is; they are not
+		# passed to the command, which is told about a commit, not a branch.
+		printf '        ^ %s\n' "${BOUNDARY_LABEL_AT[$hash]}"
+		if [[ -n "$command" ]]; then
+			printf '%s\n' "$hash" >>"$spec"
+			printf '        exec %s\n' "$command"
+		fi
+	done
+
+	if [[ -n "$command" ]]; then
+		printf '\n%d PR boundary(ies) will run the command.\n' "$n"
+		[[ "$n" -gt 0 ]] || die "no PR tip found in $base..$branch — nothing would run"
+	else
+		printf '\n%d PR branch(es) in range; --update-refs will carry them along.\n' "$n"
+	fi
+
+	if [[ "$dry_run" -eq 1 ]]; then
+		printf '\nDry run — re-run without --dry-run to rebase.\n'
+		return 0
+	fi
+
+	# Resolve the editor git would have used *before* taking its place, so the
+	# whole precedence chain (GIT_SEQUENCE_EDITOR, sequence.editor, core.editor,
+	# GIT_EDITOR, EDITOR, …) is honoured rather than reimplemented. Asking for
+	# it later, from inside our own sequence editor, would just find us.
+	local real_editor=""
+	if [[ "$no_edit" -eq 0 ]]; then
+		real_editor="$(git var GIT_SEQUENCE_EDITOR)"
+		[[ -t 0 ]] ||
+			die "not a terminal: the todo cannot be reviewed here — re-run with --no-edit to rebase unattended"
+	fi
+
+	printf '\nRebasing %s onto %s with --update-refs.\n' "$branch" "$base"
+	[[ -n "$command" ]] &&
+		printf 'A failing command stops the rebase mid-flight; fix and "git rebase --continue", or "git rebase --abort".\n'
+	[[ -n "$real_editor" ]] &&
+		printf 'The todo opens for review with the exec lines already in it; quit the editor with an error to call it off.\n'
+	printf '\n'
+
+	# Always the interactive machinery, with or without --exec, so the two
+	# modes cannot drift apart: same walk, same --update-refs, same resume
+	# behaviour, same chance to inspect the todo.
+	#
+	# --update-refs is what keeps this usable on a stack: every PR branch is
+	# carried onto its commit, so the map still describes reality afterwards.
+	# When the stack already sits on <base> the picks fast-forward and the
+	# hashes survive untouched; they are only rewritten if the rebase has real
+	# work to do, exactly as any other rebase onto a moved base would.
+	PR_STACK_SPEC="$spec" PR_STACK_COMMAND="$command" PR_STACK_EDITOR="$real_editor" \
+		GIT_SEQUENCE_EDITOR="'$SELF' __todo-edit" \
+		git rebase --interactive --update-refs --no-autosquash "$base" "$branch"
 }
 
 cmd_push() {
@@ -472,6 +772,9 @@ remap) cmd_remap "$@" ;;
 push) cmd_push "$@" ;;
 capture) cmd_capture "$@" ;;
 advance) cmd_advance "$@" ;;
+rebase) cmd_rebase "$@" ;;
+# Internal: git calls this back as the rebase sequence editor.
+__todo-edit) cmd_todo_edit "$@" ;;
 -h | --help) usage 0 ;;
-*) die "unknown command: $command (expected 'remap', 'push', 'capture', or 'advance')" ;;
+*) die "unknown command: $command (expected 'remap', 'push', 'capture', 'advance', or 'rebase')" ;;
 esac
