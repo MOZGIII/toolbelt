@@ -176,7 +176,7 @@ resolve_map_commits() {
 
 	PLAN_HASHES=()
 	PLAN_SUBJECTS=()
-	local errors=0 i pattern matches count hash subject
+	local errors=0 i pattern matches count hash subject exact exact_count
 	for i in "${!MAP_BRANCHES[@]}"; do
 		pattern="${MAP_PATTERNS[$i]}"
 
@@ -184,6 +184,20 @@ resolve_map_commits() {
 		matches="$(printf '%s\n' "$commits" | awk -F'\t' -v p="$pattern" 'index($2, p) { print }')" || true
 		count=0
 		[[ -n "$matches" ]] && count="$(printf '%s\n' "$matches" | grep -c '')"
+
+		# Several substring matches still resolve when exactly one of them is
+		# the whole subject: a later `Revert "<subject>"` contains the original
+		# subject without being it, and capture writes full subjects as
+		# patterns.
+		if [[ "$count" -gt 1 ]]; then
+			exact="$(printf '%s\n' "$matches" | awk -F'\t' -v p="$pattern" '$2 == p { print }')" || true
+			exact_count=0
+			[[ -n "$exact" ]] && exact_count="$(printf '%s\n' "$exact" | grep -c '')"
+			if [[ "$exact_count" -eq 1 ]]; then
+				matches="$exact"
+				count=1
+			fi
+		fi
 
 		if [[ "$count" -eq 0 ]]; then
 			printf 'error: no commit in %s matches "%s" (branch %s)\n' "$range" "$pattern" "${MAP_BRANCHES[$i]}" >&2
@@ -738,11 +752,16 @@ cmd_advance() {
 		[[ -n "$pattern" ]] || die "$map_file:$lineno: no commit message pattern for branch $pr_branch"
 
 		merged=0
+		# A `Revert "<subject>"` landing in the base contains the original
+		# subject without the original commit having landed, so a match inside
+		# a revert subject does not count — unless the pattern is itself a
+		# revert subject, in which case revert commits are what it tracks.
 		if git show-ref --verify --quiet "refs/heads/$pr_branch" &&
 			git merge-base --is-ancestor "$pr_branch" "refs/heads/$base"; then
 			merged=1
 		elif [[ -n "$new_subjects" ]] &&
-			printf '%s\n' "$new_subjects" | awk -v p="$pattern" 'index($0, p) { found = 1 } END { exit !found }'; then
+			printf '%s\n' "$new_subjects" | awk -v p="$pattern" \
+				'index($0, p) && !($0 ~ /^Revert "/ && p !~ /^Revert "/) { found = 1 } END { exit !found }'; then
 			merged=1
 		fi
 
