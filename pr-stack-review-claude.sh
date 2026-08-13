@@ -84,6 +84,11 @@
 #   review-all [options] <plan-file>
 #       Review every active entry in the plan, bottom first, skipping the ones
 #       already reviewed. Stops at the first failure unless --keep-going.
+#       With --failed the selection flips: instead of the entries not yet
+#       reviewed, take the ones whose latest verdict came back "false" — the
+#       rejections, to be re-reviewed once the code is fixed. Only a decided
+#       "false" qualifies: errored, malformed and unfinished runs are pending,
+#       not rejected, and the ordinary selection is what retries those.
 #
 #   status [options] <plan-file>
 #       Show which plan entries have been reviewed and what they came back
@@ -157,13 +162,20 @@ Commands:
         directories and session names are shaped accordingly, and the merge
         script's --require-local-review gate does not look for them.
 
-  review-all [options] [--max <n>] [--keep-going] <plan-file>
+  review-all [options] [--failed] [--max <n>] [--keep-going] <plan-file>
         Review every not-yet-reviewed active entry in the plan, bottom
         first. Stops at the first failure so nothing is silently skipped;
         --keep-going records the failure and carries on. Re-run to resume.
         A branch whose verdict file is missing or unreadable counts as
         not reviewed, so a run that went wrong is retried rather than
         quietly accepted.
+        --failed flips the selection: take the entries whose latest verdict
+        is "false" instead — the rejections, for re-review once the code is
+        fixed. Only a decided "false" qualifies; errored and unfinished
+        runs are pending, which the ordinary selection retries. Each
+        re-review is a fresh numbered run beside the one it answers.
+        Refuses --force, which redoes decided entries regardless of their
+        verdict: to redo passed reviews too, drop --failed.
 
   status [--output-dir <dir>] <plan-file>
         Print each plan entry with its review state and verdict.
@@ -1017,13 +1029,17 @@ cmd_review_standalone() {
 # ---------------------------------------------------------------------------
 
 cmd_review_all() {
-	local plan_file="" trunk="main" max=0 keep_going=0
+	local plan_file="" trunk="main" max=0 keep_going=0 failed=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--trunk)
 			trunk="${2:-}"
 			[[ -n "$trunk" ]] || die "--trunk requires a value"
 			shift 2
+			;;
+		--failed)
+			failed=1
+			shift
 			;;
 		--max)
 			max="${2:-}"
@@ -1047,6 +1063,12 @@ cmd_review_all() {
 		esac
 	done
 	[[ -n "$plan_file" ]] || usage 1
+	# --force redoes decided entries regardless of what they decided; --failed
+	# selects *by* the decision. Combining them is a contradiction, not a
+	# stronger ask, and the honest spelling of "redo passed ones too" is
+	# --force alone.
+	[[ "$failed" -eq 0 || "$FORCE" -eq 0 ]] ||
+		die "--failed and --force contradict each other: --failed re-reviews by verdict, --force regardless of it; to redo passed reviews too, drop --failed"
 
 	require_tools
 	claim_worktree
@@ -1061,19 +1083,32 @@ cmd_review_all() {
 	for i in "${!PLAN_BRANCHES[@]}"; do
 		[[ "${PLAN_ACTIVE[$i]}" -eq 1 ]] || continue
 		set_review_paths "$OUTPUT_DIR" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}"
-		if [[ "$FORCE" -eq 0 ]] && review_is_done "$REVIEW_VERDICT"; then
+		if [[ "$failed" -eq 1 ]]; then
+			# Only a decided "false" is a rejection. Missing, malformed and
+			# unfinished runs are pending, and pending is the ordinary
+			# selection's to retry — picking them up here would blur "the
+			# review said no" with "the review never happened".
+			[[ "$(read_verdict "$REVIEW_VERDICT")" == "false" ]] || continue
+		elif [[ "$FORCE" -eq 0 ]] && review_is_done "$REVIEW_VERDICT"; then
 			continue
 		fi
 		todo_idx+=("$i")
 	done
 
 	if [[ ${#todo_idx[@]} -eq 0 ]]; then
-		printf '%sNothing to review.%s Every active entry in %s already has a verdict.\n' \
-			"$BOLD" "$RESET" "$plan_file"
+		if [[ "$failed" -eq 1 ]]; then
+			printf '%sNothing to re-review.%s No active entry in %s has a latest verdict of "false".\n' \
+				"$BOLD" "$RESET" "$plan_file"
+		else
+			printf '%sNothing to review.%s Every active entry in %s already has a verdict.\n' \
+				"$BOLD" "$RESET" "$plan_file"
+		fi
 		return 0
 	fi
 
-	printf '%s%d branch(es) to review from %s.%s\n' "$BOLD" "${#todo_idx[@]}" "$plan_file" "$RESET"
+	local doing="review"
+	[[ "$failed" -eq 1 ]] && doing="re-review"
+	printf '%s%d branch(es) to %s from %s.%s\n' "$BOLD" "${#todo_idx[@]}" "$doing" "$plan_file" "$RESET"
 
 	local done_count=0 failed_count=0 idx branch base pr title verdict
 	local -a summary=()
