@@ -41,8 +41,9 @@
 #         1. verify the local stack matches the map (pr-stack.sh remap --check)
 #            and that the PR branch matches its remote tip;
 #         2. retarget the PR onto <base> if it still points at a merged branch;
-#         3. wait until it is approved, CI is green, and — with
-#            --require-local-review — a local review run says it is ready;
+#         3. wait until it is approved, its review conversations are all
+#            resolved, CI is green, and — with --require-local-review — a
+#            local review run says it is ready;
 #         4. merge via GitHub, wait for the merge to land;
 #         5. pr-stack.sh advance — pull <base>, comment the merged branch out
 #            of the map;
@@ -54,13 +55,20 @@
 #       nothing is left half-applied on purpose.
 #
 #       The readiness step is a wait, not an abort: a missing approval, a
-#       draft PR, red or missing checks — and a failed status query, which
-#       says nothing about the PR — are all retried until the PR becomes
-#       mergeable (or --ci-timeout elapses), so a run can be left unattended
-#       while a reviewer approves and somebody fixes the build. An
-#       unapproved PR outranks a red build as the reported blocker, since
-#       it cannot merge either way. --no-wait-ci
+#       draft PR, an unresolved review conversation, red or missing checks —
+#       and a failed status query, which says nothing about the PR — are all
+#       retried until the PR becomes mergeable (or --ci-timeout elapses), so
+#       a run can be left unattended while a reviewer approves, somebody
+#       resolves the open threads and somebody fixes the build. An
+#       unapproved or unresolved PR outranks a red build as the reported
+#       blocker, since it cannot merge either way. --no-wait-ci
 #       restores fail-fast behaviour for interactive use.
+#
+#       Unresolved conversations gate by default, mirroring GitHub's own
+#       "all conversations resolved" branch protection; --allow-unresolved
+#       turns that gate off. It is read over GraphQL, the only place this
+#       script needs it: thread resolution is absent from the REST-backed
+#       `gh pr view --json` field set.
 #
 #       --require-local-review adds a third gate, independent of the other
 #       two: the newest local review run for this PR (as written by
@@ -220,6 +228,12 @@ Commands:
                        <repo-root>/.reviews). Implies --require-local-review.
         --skip-approval
                        merge without an approving review.
+        --allow-unresolved
+                       merge with review conversations still unresolved.
+                       They gate by default, like GitHub's own "all
+                       conversations resolved" protection, and like the
+                       other gates an open thread is waited on rather than
+                       aborted at.
         --no-wait-ci   abort on the first red or missing CI result, or the
                        first unapproved PR, instead of waiting (the old
                        behaviour, for interactive use).
@@ -253,11 +267,12 @@ Commands:
                        resolves on its own.
 
   status [--local-reviews-dir <path>] <plan-file>
-        Show the plan's progress: merged entries, what is up next, and two
-        review columns per remaining PR — its GitHub review state (one API
-        call per PR; a failed query shows "?" rather than aborting, since it
-        says nothing about the PR either way) and the verdict of its newest
-        local review run, the same two gates merge-next waits on.
+        Show the plan's progress: merged entries, what is up next, and three
+        review columns per remaining PR — its GitHub review state, its
+        unresolved review conversations, and the verdict of its newest local
+        review run: the same three gates merge-next waits on. Costs two API
+        calls per PR; a failed query shows "?" rather than aborting, since it
+        says nothing about the PR either way.
 
         --local-reviews-dir <path>
                        where the local reviews live (default:
@@ -518,14 +533,20 @@ cmd_status() {
 		printf '\nThe train is complete.\n'
 		return 0
 	fi
-	# The two review columns are independent gates that merge-next weighs
+	# The three review columns are the independent gates merge-next weighs
 	# separately, so they are shown separately too: a PR can be approved on
 	# GitHub with no local review run against it, or reviewed locally and never
-	# approved. A header keeps two same-shaped columns of adjectives apart.
+	# approved, or both with a review conversation still open. A header keeps
+	# three same-shaped columns of adjectives apart.
+	local width=0 i
+	for i in "${!PLAN_BRANCHES[@]}"; do
+		[[ ${#PLAN_BRANCHES[$i]} -gt $width ]] && width=${#PLAN_BRANCHES[$i]}
+	done
 	printf '\nUp next:\n'
-	printf '     %-11s %-10s %-6s %-48s %s\n' 'github' 'local' 'pr' 'branch' 'title'
-	local i marker label local_label approved=0 reviewed=0
-	local status pr_state pr_draft pr_decision
+	printf '     %-11s %-10s %-8s %-6s %-*s %s\n' \
+		'github' 'local' 'threads' 'pr' "$width" 'branch' 'title'
+	local marker label local_label thread_label approved=0 reviewed=0 resolved=0
+	local status pr_state pr_draft pr_decision unresolved
 	for i in "${!PLAN_BRANCHES[@]}"; do
 		if [[ $i -eq 0 ]]; then marker="->"; else marker="  "; fi
 		# A query that fails says nothing about the PR, so it degrades to "?"
@@ -536,15 +557,21 @@ cmd_status() {
 		else
 			label="?"
 		fi
+		if unresolved="$(poll_unresolved_threads "${PLAN_NUMBERS[$i]}")"; then
+			thread_label="$(unresolved_label "$unresolved")"
+		else
+			thread_label="?"
+		fi
 		local_label="$(local_review_label "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
 		[[ "$label" == "approved" ]] && approved=$((approved + 1))
 		[[ "$local_label" == "ready" ]] && reviewed=$((reviewed + 1))
-		printf '  %s %-11s %-10s #%-5s %-48s %s\n' \
-			"$marker" "$label" "$local_label" "${PLAN_NUMBERS[$i]}" \
-			"${PLAN_BRANCHES[$i]}" "${PLAN_TITLES[$i]}"
+		[[ "$thread_label" == "resolved" ]] && resolved=$((resolved + 1))
+		printf '  %s %-11s %-10s %-8s #%-5s %-*s %s\n' \
+			"$marker" "$label" "$local_label" "$thread_label" "${PLAN_NUMBERS[$i]}" \
+			"$width" "${PLAN_BRANCHES[$i]}" "${PLAN_TITLES[$i]}"
 	done
-	printf '\n%d of %d approved, %d locally reviewed.\n' \
-		"$approved" "${#PLAN_BRANCHES[@]}" "$reviewed"
+	printf '\n%d of %d approved, %d locally reviewed, %d fully resolved.\n' \
+		"$approved" "${#PLAN_BRANCHES[@]}" "$reviewed" "$resolved"
 }
 
 # ---------------------------------------------------------------------------
@@ -688,6 +715,76 @@ review_label() {
 	"") printf 'no review' ;;
 	*) printf '%s' "$decision" ;;
 	esac
+}
+
+# The review threads on a PR, page by page. Review-thread resolution is not in
+# gh's REST-backed `pr view --json` field set at all, so this is the one place
+# the script has to reach for GraphQL. "{owner}"/"{repo}" are substituted by gh
+# from the repository of the current directory, as in any `gh api` endpoint.
+#
+# $endCursor and the pageInfo block are what make `gh api --paginate` work: a
+# PR with more than a page of threads must not silently report only the first
+# hundred, since undercounting here reads as "all resolved" and would open the
+# merge gate.
+# shellcheck disable=SC2016  # single-quoted: $owner and friends are GraphQL variables, not shell ones
+UNRESOLVED_THREADS_QUERY='query($owner:String!,$name:String!,$number:Int!,$endCursor:String){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      reviewThreads(first:100,after:$endCursor){
+        nodes{isResolved}
+        pageInfo{hasNextPage,endCursor}
+      }
+    }
+  }
+}'
+
+# poll_unresolved_threads <pr-number>
+#
+# Prints the number of unresolved review conversations on the PR. Returns
+# nonzero when the query itself failed, which — like every other read here —
+# says nothing about the PR and must not be read as "nothing unresolved".
+#
+# Outdated threads are counted like any other: GitHub's own "all conversations
+# resolved" protection does not exempt them, and a comment does not stop
+# mattering because the line beneath it moved.
+poll_unresolved_threads() {
+	local number="$1" out count=0 line
+	out="$(gh_json api graphql --paginate -f query="$UNRESOLVED_THREADS_QUERY" \
+		-F owner='{owner}' -F name='{repo}' -F number="$number" \
+		--jq '.data.repository.pullRequest.reviewThreads.nodes[]
+			| select(.isResolved | not) | .isResolved')" || return 1
+
+	# One line per unresolved thread, across every page.
+	while IFS= read -r line; do
+		[[ -n "$line" ]] && count=$((count + 1))
+	done <<<"$out"
+	printf '%s' "$count"
+}
+
+# unresolved_blocker <count>
+#
+# Prints why the conversations do not clear this PR for merging, or nothing
+# when they are all resolved.
+unresolved_blocker() {
+	local count="$1"
+	[[ "$count" -gt 0 ]] || return 0
+	if [[ "$count" -eq 1 ]]; then
+		printf '1 unresolved conversation'
+	else
+		printf '%d unresolved conversations' "$count"
+	fi
+}
+
+# unresolved_label <count>
+#
+# The column form of unresolved_blocker.
+unresolved_label() {
+	local count="$1"
+	if [[ "$count" -eq 0 ]]; then
+		printf 'resolved'
+	else
+		printf '%d open' "$count"
+	fi
 }
 
 # review_slug <pr-number> <branch>
@@ -875,7 +972,7 @@ cmd_merge_next() {
 	local skip_ci=0 skip_approval=0 dry_run=0 ci_interval=30 merge_timeout=300
 	local wait_ci=1 ci_retry_interval=120 ci_timeout=0 no_checks_timeout=900
 	local required_only=""
-	local require_local_review=0 local_reviews_dir=""
+	local require_local_review=0 local_reviews_dir="" allow_unresolved=0
 	local positional=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
@@ -895,6 +992,7 @@ cmd_merge_next() {
 		--ignore-checks-file) [[ -n "${2:-}" ]] || die "--ignore-checks-file requires a value"; load_ignore_checks_file "$2"; shift 2 ;;
 		--require-local-review) require_local_review=1; shift ;;
 		--local-reviews-dir) local_reviews_dir="${2:-}"; [[ -n "$local_reviews_dir" ]] || die "--local-reviews-dir requires a value"; require_local_review=1; shift 2 ;;
+		--allow-unresolved) allow_unresolved=1; shift ;;
 		--skip-ci) skip_ci=1; shift ;;
 		--skip-approval) skip_approval=1; shift ;;
 		--dry-run) dry_run=1; shift ;;
@@ -1014,13 +1112,14 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 
 		# --- readiness: approval + CI ------------------------------------
 		local ci_rounds=0
-		if [[ "$skip_ci" -eq 1 && "$skip_approval" -eq 1 && "$require_local_review" -eq 0 ]]; then
-			step "Skipping the approval and CI waits (--skip-approval --skip-ci)"
+		if [[ "$skip_ci" -eq 1 && "$skip_approval" -eq 1 && "$require_local_review" -eq 0 &&
+			"$allow_unresolved" -eq 1 ]]; then
+			step "Skipping the approval, conversation and CI waits (--skip-approval --allow-unresolved --skip-ci)"
 		else
 			step "Waiting for PR #$number to become mergeable"
 			local checks ci_state summary waited_ci=0 no_checks_waited=0
 			local delay reason head_oid last_head=""
-			local status pr_now pr_draft pr_decision blocker
+			local status pr_now pr_draft pr_decision blocker unresolved
 			while :; do
 				# One call answers three questions: did the PR move under us, is
 				# it still a draft, and has it been approved.
@@ -1048,10 +1147,18 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 				# approved. Letting one short-circuit the other would hide
 				# whichever came second and turn a two-item fix list into two
 				# round trips.
-				local blockers=() local_blocker="" approval=""
+				local blockers=() local_blocker="" approval="" conversations=""
 				if [[ "$require_local_review" -eq 1 ]]; then
 					local_blocker="$(local_review_blocker "$number" "$branch" "$local_reviews_dir")"
 					[[ -z "$local_blocker" ]] || blockers+=("local review: $local_blocker")
+				fi
+				if [[ "$allow_unresolved" -eq 0 ]]; then
+					if unresolved="$(poll_unresolved_threads "$number")"; then
+						conversations="$(unresolved_blocker "$unresolved")"
+					else
+						conversations="could not read the PR's review conversations"
+					fi
+					[[ -z "$conversations" ]] || blockers+=("$conversations")
 				fi
 				if [[ "$skip_approval" -eq 0 ]]; then
 					if [[ -z "$pr_now" ]]; then
@@ -1081,24 +1188,26 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 				if [[ -z "$blocker" && "$ci_state" == "green" ]]; then
 					local ready_desc="checks are green"
 					[[ "$skip_approval" -eq 0 ]] && ready_desc="approved and $ready_desc"
+					[[ "$allow_unresolved" -eq 0 ]] && ready_desc="conversations resolved, $ready_desc"
 					[[ "$require_local_review" -eq 1 ]] && ready_desc="locally reviewed, $ready_desc"
 					note "$ready_desc ($summary)"
 					break
 				fi
 
-				# Approval outranks CI: no point reporting a red build as the
-				# blocker when the PR could not be merged approved-or-not. This
+				# The human gates outrank CI: no point reporting a red build as
+				# the blocker when the PR could not be merged green-or-not. This
 				# also keeps --no-checks-timeout from firing while the real wait
 				# is on a human.
 				if [[ -n "$blocker" ]]; then
 					[[ "$wait_ci" -eq 1 ]] ||
 						die_resumable "PR #$number is not ready to merge: $blocker" \
 							"Clear the blocker(s) above, then re-run — or drop --no-wait-ci to keep waiting.
-Use --skip-approval to merge without a GitHub approval; drop
---require-local-review to merge without a local review verdict."
+Use --skip-approval to merge without a GitHub approval; --allow-unresolved to
+merge with review conversations still open; drop --require-local-review to
+merge without a local review verdict."
 					if [[ "$ci_timeout" -gt 0 && "$waited_ci" -ge "$ci_timeout" ]]; then
-						die_resumable "PR #$number still not approved after ${waited_ci}s ($blocker)" \
-							"Get it approved, then re-run."
+						die_resumable "PR #$number is still not ready after ${waited_ci}s ($blocker)" \
+							"Clear the blocker(s) above, then re-run."
 					fi
 					tick "$blocker; checks: $summary — next check in ${ci_retry_interval}s"
 					sleep "$ci_retry_interval"
