@@ -252,8 +252,16 @@ Commands:
                        --ci-timeout because "no CI configured" never
                        resolves on its own.
 
-  status <plan-file>
-        Show the plan's progress: merged entries and what is up next.
+  status [--local-reviews-dir <path>] <plan-file>
+        Show the plan's progress: merged entries, what is up next, and two
+        review columns per remaining PR — its GitHub review state (one API
+        call per PR; a failed query shows "?" rather than aborting, since it
+        says nothing about the PR either way) and the verdict of its newest
+        local review run, the same two gates merge-next waits on.
+
+        --local-reviews-dir <path>
+                       where the local reviews live (default:
+                       <repo-root>/.reviews), as for merge-next.
 
   checks [--required-only] [--ignore-checks-file <path>]
          [--ignore-check <name-or-glob>] <pr-number>
@@ -482,10 +490,24 @@ cmd_plan() {
 # ---------------------------------------------------------------------------
 
 cmd_status() {
-	[[ $# -eq 1 ]] || usage 1
-	case "$1" in -h | --help) usage 0 ;; esac
-	local plan_file="$1"
+	local plan_file="" local_reviews_dir=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--local-reviews-dir) local_reviews_dir="${2:-}"; [[ -n "$local_reviews_dir" ]] || die "--local-reviews-dir requires a value"; shift 2 ;;
+		-h | --help) usage 0 ;;
+		-*) die "unknown option: $1" ;;
+		*)
+			[[ -z "$plan_file" ]] || die "unexpected argument: $1"
+			plan_file="$1"
+			shift
+			;;
+		esac
+	done
+	[[ -n "$plan_file" ]] || usage 1
 	[[ -f "$plan_file" ]] || die "plan file not found: $plan_file"
+	[[ -n "$local_reviews_dir" ]] || local_reviews_dir="$(git rev-parse --show-toplevel)/.reviews"
+	# pr-stack.sh is not involved here, so this is deliberately not require_tools.
+	command -v gh >/dev/null || die "gh (GitHub CLI) is required but not on PATH"
 
 	local merged_count
 	merged_count="$(grep -c '^# \[merged\] ' "$plan_file" || true)"
@@ -496,13 +518,33 @@ cmd_status() {
 		printf '\nThe train is complete.\n'
 		return 0
 	fi
+	# The two review columns are independent gates that merge-next weighs
+	# separately, so they are shown separately too: a PR can be approved on
+	# GitHub with no local review run against it, or reviewed locally and never
+	# approved. A header keeps two same-shaped columns of adjectives apart.
 	printf '\nUp next:\n'
-	local i marker
+	printf '     %-11s %-10s %-6s %-48s %s\n' 'github' 'local' 'pr' 'branch' 'title'
+	local i marker label local_label approved=0 reviewed=0
+	local status pr_state pr_draft pr_decision
 	for i in "${!PLAN_BRANCHES[@]}"; do
 		if [[ $i -eq 0 ]]; then marker="->"; else marker="  "; fi
-		printf '  %s #%-5s %-48s %s\n' \
-			"$marker" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "${PLAN_TITLES[$i]}"
+		# A query that fails says nothing about the PR, so it degrades to "?"
+		# rather than taking down a listing that is otherwise perfectly good.
+		if status="$(poll_pr_status "${PLAN_NUMBERS[$i]}")"; then
+			IFS=$'\t' read -r pr_state pr_draft pr_decision <<<"$status"
+			label="$(review_label "$pr_state" "$pr_draft" "$pr_decision")"
+		else
+			label="?"
+		fi
+		local_label="$(local_review_label "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
+		[[ "$label" == "approved" ]] && approved=$((approved + 1))
+		[[ "$local_label" == "ready" ]] && reviewed=$((reviewed + 1))
+		printf '  %s %-11s %-10s #%-5s %-48s %s\n' \
+			"$marker" "$label" "$local_label" "${PLAN_NUMBERS[$i]}" \
+			"${PLAN_BRANCHES[$i]}" "${PLAN_TITLES[$i]}"
 	done
+	printf '\n%d of %d approved, %d locally reviewed.\n' \
+		"$approved" "${#PLAN_BRANCHES[@]}" "$reviewed"
 }
 
 # ---------------------------------------------------------------------------
@@ -619,6 +661,35 @@ approval_blocker() {
 	esac
 }
 
+# review_label <state> <is-draft> <review-decision>
+#
+# The same fields approval_blocker turns into a sentence, as a short tag for a
+# column. Two renderings rather than one because the audiences differ: the wait
+# loop explains to somebody watching a stuck train why it is stuck, while
+# `status` prints one line per PR and has to stay scannable down the column.
+#
+# Merged and closed PRs get their own labels instead of folding into "not
+# approved": an *active* plan entry that GitHub says is already merged means
+# the plan is stale, which is the one thing here worth noticing immediately.
+review_label() {
+	local state="$1" is_draft="$2" decision="$3"
+	case "$state" in
+	MERGED) printf 'merged'; return 0 ;;
+	CLOSED) printf 'closed'; return 0 ;;
+	esac
+	if [[ "$is_draft" == "true" ]]; then
+		printf 'draft'
+		return 0
+	fi
+	case "$decision" in
+	APPROVED) printf 'approved' ;;
+	CHANGES_REQUESTED) printf 'changes req' ;;
+	REVIEW_REQUIRED) printf 'unapproved' ;;
+	"") printf 'no review' ;;
+	*) printf '%s' "$decision" ;;
+	esac
+}
+
 # review_slug <pr-number> <branch>
 #
 # The directory pr-stack-review-claude.sh files a branch's reviews under. Kept
@@ -662,6 +733,26 @@ local_review_blocker() {
 	false) printf 'the latest local review says this PR is not ready' ;;
 	"") printf 'local review verdict is empty (%s)' "$verdict_file" ;;
 	*) printf 'local review verdict is not true/false but "%s" (%s)' "$value" "$verdict_file" ;;
+	esac
+}
+
+# local_review_label <pr-number> <branch> <reviews-dir>
+#
+# The column form of local_review_blocker, for the same reason review_label is
+# the column form of approval_blocker: a path-carrying sentence is what you
+# want when a wait is stuck on you, and unreadable as a table cell.
+local_review_label() {
+	local number="$1" branch="$2" dir="$3"
+	local verdict_file value
+	verdict_file="$dir/$(review_slug "$number" "$branch")/latest/verdict"
+
+	[[ -f "$verdict_file" ]] || { printf 'none'; return 0; }
+
+	value="$(tr -d '[:space:]' <"$verdict_file" | tr '[:upper:]' '[:lower:]')"
+	case "$value" in
+	true) printf 'ready' ;;
+	false) printf 'not ready' ;;
+	*) printf 'malformed' ;;
 	esac
 }
 
