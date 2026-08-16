@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pr-stack-review-claude.sh — run a Claude Code review over one PR branch, or
+# pr-stack-review-claude — run a Claude Code review over one PR branch, or
 # over a whole merge-order plan, one branch at a time.
 #
 # The script owns the git worktree it runs in: it checks out each branch under
@@ -51,8 +51,9 @@
 # plan run that dies halfway through resumes where it stopped, and --force
 # means "review it again into a new run", never "overwrite what is there".
 #
-# The prompt is a template file (default: prompts/code-review.md next to this
-# script) with these placeholders substituted before the run:
+# The prompt is a template file (default: share/prompts/code-review.md under
+# this script's prefix — bin/ and share/ are siblings, in the repo as much as
+# in an install tree) with these placeholders substituted before the run:
 #
 #   {{BRANCH}}       branch under review
 #   {{BASE}}         branch it is reviewed against (its parent in the stack)
@@ -94,14 +95,33 @@
 #       Show which plan entries have been reviewed and what they came back
 #       with. Touches neither git nor Claude.
 #
-# Plan file format is pr-stack-merge-gh.sh's: "<branch>  #<pr-number>
+# Plan file format is pr-stack-merge-gh's: "<branch>  #<pr-number>
 # <pr-title>", one per line, whole-line "#" comments. Entries commented out as
 # merged are still read, because they are still part of the base chain.
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROMPT_FILE_DEFAULT="$SCRIPT_DIR/prompts/code-review.md"
+# resolve_self <path>
+#
+# Absolute path to <path>, symlinks resolved where the system can do it:
+# `readlink -f` is GNU coreutils, so it is absent on macOS and on minimal
+# images. The fallback leaves symlinks unresolved, which is right in every case
+# but the one readlink was there for — a bin entry symlinked onto PATH, whose
+# siblings and assets then have to be looked for beside the symlink instead.
+resolve_self() {
+	local path="$1" resolved
+	if resolved="$(readlink -f "$path" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+		printf '%s' "$resolved"
+	else
+		printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+	fi
+}
+
+# bin/ and share/ are siblings under a prefix, which the repo itself mirrors,
+# so this resolves the same way in a checkout and under an install prefix.
+BIN_DIR="$(dirname "$(resolve_self "${BASH_SOURCE[0]}")")"
+PREFIX="$(dirname "$BIN_DIR")"
+PROMPT_FILE_DEFAULT="$PREFIX/share/prompts/code-review.md"
 
 # Reviews run unattended, so nothing may take over the terminal or wait for
 # input. Drop colour when stdout is redirected so logs stay clean.
@@ -141,7 +161,7 @@ require_tools() {
 
 usage() {
 	cat >&2 <<'EOF'
-Usage: pr-stack-review-claude.sh <command> [options] [args]
+Usage: pr-stack-review-claude <command> [options] [args]
 
 Commands:
   review [options] <plan-file> <branch>
@@ -188,8 +208,8 @@ Options (all review commands):
                        numbered directory per run (001, 002, …) plus a
                        "latest" symlink; a run holds output.jsonl, debug.log,
                        review.md and verdict.
-  --prompt-file <path> prompt template (default: prompts/code-review.md
-                       next to this script)
+  --prompt-file <path> prompt template (default: share/prompts/code-review.md
+                       under this script's prefix)
   --model <name>       passed to claude --model (default: fable); pass an
                        empty string to leave the model unset and take
                        whatever claude defaults to

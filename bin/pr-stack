@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pr-stack.sh — manage a stack of PR branches from a map file.
+# pr-stack — manage a stack of PR branches from a map file.
 #
 # In a stacked-PR workflow each PR branch points at a specific commit in a
 # stack. A map file records "branch name -> commit message substring":
@@ -61,7 +61,7 @@ current_branch() {
 
 usage() {
 	cat >&2 <<'EOF'
-Usage: pr-stack.sh <command> [options] <map-file> [args]
+Usage: pr-stack <command> [options] <map-file> [args]
 
 Commands:
   remap [--apply | --check] [--base <ref>] <map-file> [<branch>]
@@ -321,9 +321,24 @@ cmd_remap() {
 # exec
 # ---------------------------------------------------------------------------
 
+# resolve_self <path>
+#
+# Absolute path to <path>, symlinks resolved where the system can do it:
+# `readlink -f` is GNU coreutils, so it is absent on macOS and on minimal
+# images. The fallback leaves symlinks unresolved, which still names a runnable
+# file — a symlink on PATH is executable like any other.
+resolve_self() {
+	local path="$1" resolved
+	if resolved="$(readlink -f "$path" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+		printf '%s' "$resolved"
+	else
+		printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+	fi
+}
+
 # Absolute path to this script, so the rebase can call back into it as its
 # sequence editor.
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SELF="$(resolve_self "${BASH_SOURCE[0]}")"
 
 # cmd_todo_edit <todo-file>
 #
