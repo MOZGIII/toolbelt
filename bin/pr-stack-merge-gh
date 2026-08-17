@@ -119,42 +119,26 @@ resolve_self() {
 }
 
 BIN_DIR="$(dirname "$(resolve_self "${BASH_SOURCE[0]}")")"
+PREFIX="$(dirname "$BIN_DIR")"
 PR_STACK="${PR_STACK:-$BIN_DIR/pr-stack}"
+
+# die() is itself in common.sh, so failing to load it cannot be reported with it.
+for module in common plan review; do
+	# shellcheck source=/dev/null
+	. "$PREFIX/lib/$module.sh" || {
+		printf 'error: cannot load %s\n' "$PREFIX/lib/$module.sh" >&2
+		exit 1
+	}
+done
 
 # Nothing here may take over the terminal: no prompts, no pager, no update
 # banners, and no live-redrawing UI (the CI step polls JSON rather than using
-# `gh pr checks --watch`). When stdout is not a terminal, drop colour too so
-# log files stay free of escape sequences.
+# `gh pr checks --watch`). Colour is handled in common.sh, which drops it when
+# stdout is not a terminal so log files stay free of escape sequences.
 export GH_PROMPT_DISABLED=1
 export GH_NO_UPDATE_NOTIFIER=1
 export GH_NO_EXTENSION_UPDATE_NOTIFIER=1
 export GH_PAGER=cat
-if [[ -t 1 ]]; then
-	BOLD=$'\033[1m'
-	RESET=$'\033[0m'
-else
-	BOLD=""
-	RESET=""
-	export NO_COLOR=1
-fi
-
-die() {
-	printf 'error: %s\n' "$*" >&2
-	exit 1
-}
-
-step() {
-	printf '\n%s== %s%s\n' "$BOLD" "$*" "$RESET"
-}
-
-# Timestamped progress line, for the waiting loops that unattended runs log.
-tick() {
-	printf '   [%s] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')" "$*"
-}
-
-note() {
-	printf '   %s\n' "$*"
-}
 
 # Printed on every abort inside merge-next so the way back is never a guess.
 RESUME_HINT=""
@@ -163,13 +147,6 @@ die_resumable() {
 	[[ -n "${2:-}" ]] && printf '\n%s\n' "$2" >&2
 	[[ -n "$RESUME_HINT" ]] && printf '\nresume with: %s\n' "$RESUME_HINT" >&2
 	exit 1
-}
-
-current_branch() {
-	local b
-	b="$(git symbolic-ref --short -q HEAD)" ||
-		die "detached HEAD — specify a branch explicitly"
-	printf '%s' "$b"
 }
 
 # gh_json <gh-args...>
@@ -310,72 +287,12 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Plan file handling
+# Map file handling
+#
+# The plan file format lives in lib/plan.sh, shared with the reviewer that
+# reads the same file. The map is pr-stack's format, and this is the only part
+# of it read here.
 # ---------------------------------------------------------------------------
-
-# parse_plan_file <plan-file>
-#
-# Fills PLAN_BRANCHES / PLAN_NUMBERS / PLAN_TITLES with the *active* (not
-# commented out) entries, in file order. Only whole-line "#" comments are
-# stripped: "#490" is data, not a comment.
-PLAN_BRANCHES=()
-PLAN_NUMBERS=()
-PLAN_TITLES=()
-parse_plan_file() {
-	local plan_file="$1"
-	[[ -f "$plan_file" ]] || die "plan file not found: $plan_file"
-
-	PLAN_BRANCHES=()
-	PLAN_NUMBERS=()
-	PLAN_TITLES=()
-	local line branch number title rest lineno=0
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		lineno=$((lineno + 1))
-
-		line="${line#"${line%%[![:space:]]*}"}" # ltrim
-		line="${line%"${line##*[![:space:]]}"}" # rtrim
-		[[ -n "$line" && "$line" != \#* ]] || continue
-
-		branch="${line%%[[:space:]]*}"
-		rest="${line#"$branch"}"
-		rest="${rest#"${rest%%[![:space:]]*}"}"
-		number="${rest%%[[:space:]]*}"
-		title="${rest#"$number"}"
-		title="${title#"${title%%[![:space:]]*}"}"
-
-		[[ "$number" == \#* ]] ||
-			die "$plan_file:$lineno: expected \"#<pr-number>\" after branch $branch, got \"$number\""
-		number="${number#\#}"
-		[[ "$number" =~ ^[0-9]+$ ]] ||
-			die "$plan_file:$lineno: malformed PR number for branch $branch"
-
-		PLAN_BRANCHES+=("$branch")
-		PLAN_NUMBERS+=("$number")
-		PLAN_TITLES+=("$title")
-	done <"$plan_file"
-}
-
-# comment_out_plan_entry <plan-file> <branch> <pr-number>
-#
-# Rewrites the plan in place, prefixing the matching active entry with
-# "# [merged] ". Fails loudly if the entry is not there any more.
-comment_out_plan_entry() {
-	local plan_file="$1" branch="$2" number="$3"
-	local nl=$'\n' buf="" line stripped found=0
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		stripped="${line#"${line%%[![:space:]]*}"}"
-		if [[ "$found" -eq 0 && -n "$stripped" && "$stripped" != \#* &&
-			"${stripped%%[[:space:]]*}" == "$branch" && "$stripped" == *"#$number"* ]]; then
-			buf+="# [merged] ${line}${nl}"
-			found=1
-		else
-			buf+="${line}${nl}"
-		fi
-	done <"$plan_file"
-
-	[[ "$found" -eq 1 ]] || die "could not find active plan entry for $branch (#$number) in $plan_file"
-	printf '%s' "$buf" >"$plan_file"
-}
 
 # map_has_active_branch <map-file> <branch>
 #
@@ -542,7 +459,7 @@ cmd_status() {
 
 	local merged_count
 	merged_count="$(grep -c '^# \[merged\] ' "$plan_file" || true)"
-	parse_plan_file "$plan_file"
+	parse_plan_file --strict "$plan_file"
 
 	printf 'Plan %s: %s merged, %d remaining.\n' "$plan_file" "$merged_count" "${#PLAN_BRANCHES[@]}"
 	if [[ ${#PLAN_BRANCHES[@]} -eq 0 ]]; then
@@ -803,22 +720,6 @@ unresolved_label() {
 	fi
 }
 
-# review_slug <pr-number> <branch>
-#
-# The directory pr-stack-review-claude files a branch's reviews under. Kept
-# in step with that script by hand: the two are separate tools and the layout
-# is the contract between them, so a change there needs a change here.
-review_slug() {
-	local number="$1" branch="$2" slug
-	slug="${branch//\//-}"
-	slug="${slug//[^A-Za-z0-9._-]/-}"
-	if [[ -n "$number" ]]; then
-		printf '%s-%s' "$number" "$slug"
-	else
-		printf '%s' "$slug"
-	fi
-}
-
 # local_review_blocker <pr-number> <branch> <reviews-dir>
 #
 # Prints why the local review does not clear this PR for merging, or nothing
@@ -833,14 +734,16 @@ review_slug() {
 local_review_blocker() {
 	local number="$1" branch="$2" dir="$3"
 	local verdict_file value
-	verdict_file="$dir/$(review_slug "$number" "$branch")/latest/verdict"
+	verdict_file="$(review_verdict_file "$dir" "$number" "$branch")"
 
 	if [[ ! -f "$verdict_file" ]]; then
 		printf 'no local review verdict yet (expected %s)' "$verdict_file"
 		return 0
 	fi
 
-	value="$(tr -d '[:space:]' <"$verdict_file" | tr '[:upper:]' '[:lower:]')"
+	# Not read_verdict: this wants to tell an empty verdict from a garbled one,
+	# which the classification deliberately does not.
+	value="$(normalize_verdict "$verdict_file")"
 	case "$value" in
 	true) ;;
 	false) printf 'the latest local review says this PR is not ready' ;;
@@ -856,16 +759,13 @@ local_review_blocker() {
 # want when a wait is stuck on you, and unreadable as a table cell.
 local_review_label() {
 	local number="$1" branch="$2" dir="$3"
-	local verdict_file value
-	verdict_file="$dir/$(review_slug "$number" "$branch")/latest/verdict"
-
-	[[ -f "$verdict_file" ]] || { printf 'none'; return 0; }
-
-	value="$(tr -d '[:space:]' <"$verdict_file" | tr '[:upper:]' '[:lower:]')"
-	case "$value" in
+	local verdict
+	verdict="$(read_verdict "$(review_verdict_file "$dir" "$number" "$branch")")"
+	case "$verdict" in
 	true) printf 'ready' ;;
 	false) printf 'not ready' ;;
-	*) printf 'malformed' ;;
+	"") printf 'none' ;;
+	*) printf '%s' "$verdict" ;;
 	esac
 }
 
@@ -1048,7 +948,7 @@ cmd_merge_next() {
 	git show-ref --verify --quiet "refs/heads/$base" || die "base branch not found locally: $base"
 	git rev-parse --verify --quiet "$stack^{commit}" >/dev/null || die "stack branch not found: $stack"
 
-	parse_plan_file "$plan_file"
+	parse_plan_file --strict "$plan_file"
 	if [[ ${#PLAN_BRANCHES[@]} -eq 0 ]]; then
 		printf 'Nothing left in %s — the train is complete.\n' "$plan_file"
 		return 0
@@ -1428,7 +1328,7 @@ cmd_merge_all() {
 
 	local merged=0 before after
 	while :; do
-		parse_plan_file "$plan_file"
+		parse_plan_file --strict "$plan_file"
 		before=${#PLAN_BRANCHES[@]}
 
 		if [[ "$before" -eq 0 ]]; then
@@ -1446,7 +1346,7 @@ cmd_merge_all() {
 
 		# Guard against a merge-next that returns success without consuming an
 		# entry, which would spin forever.
-		parse_plan_file "$plan_file"
+		parse_plan_file --strict "$plan_file"
 		after=${#PLAN_BRANCHES[@]}
 		[[ "$after" -lt "$before" ]] ||
 			die "merge-next reported success but $plan_file still lists $after PR(s) — stopping instead of looping"

@@ -117,39 +117,22 @@ resolve_self() {
 	fi
 }
 
-# bin/ and share/ are siblings under a prefix, which the repo itself mirrors,
-# so this resolves the same way in a checkout and under an install prefix.
+# bin/, lib/ and share/ are siblings under a prefix, which the repo itself
+# mirrors, so this resolves the same way in a checkout as under an install tree.
 BIN_DIR="$(dirname "$(resolve_self "${BASH_SOURCE[0]}")")"
 PREFIX="$(dirname "$BIN_DIR")"
 PROMPT_FILE_DEFAULT="$PREFIX/share/prompts/code-review.md"
 
 # Reviews run unattended, so nothing may take over the terminal or wait for
-# input. Drop colour when stdout is redirected so logs stay clean.
-if [[ -t 1 ]]; then
-	BOLD=$'\033[1m'
-	RESET=$'\033[0m'
-else
-	BOLD=""
-	RESET=""
-	export NO_COLOR=1
-fi
-
-die() {
-	printf 'error: %s\n' "$*" >&2
-	exit 1
-}
-
-step() {
-	printf '\n%s== %s%s\n' "$BOLD" "$*" "$RESET"
-}
-
-note() {
-	printf '   %s\n' "$*"
-}
-
-tick() {
-	printf '   [%s] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')" "$*"
-}
+# input; common.sh drops colour when stdout is redirected so logs stay clean.
+# die() is itself in common.sh, so failing to load it cannot be reported with it.
+for module in common plan review; do
+	# shellcheck source=/dev/null
+	. "$PREFIX/lib/$module.sh" || {
+		printf 'error: cannot load %s\n' "$PREFIX/lib/$module.sh" >&2
+		exit 1
+	}
+done
 
 require_tools() {
 	command -v claude >/dev/null || die "claude (Claude Code CLI) is required but not on PATH"
@@ -253,61 +236,21 @@ EOF
 
 # ---------------------------------------------------------------------------
 # Plan file handling
+#
+# The format itself lives in lib/plan.sh, shared with the merge driver that
+# writes the same file. What is local to reviewing is which reading to ask for.
 # ---------------------------------------------------------------------------
 
-# parse_plan_file <plan-file>
+# load_plan <plan-file>
 #
-# Fills PLAN_BRANCHES / PLAN_NUMBERS / PLAN_TITLES / PLAN_ACTIVE with *every*
-# entry in file order — commented-out ones too, with PLAN_ACTIVE set to 0.
-# Merged entries still matter here: they are links in the base chain, so the
-# entry above one is reviewed against it.
-#
-# A line is an entry when its second whitespace-delimited token is "#<digits>",
-# which is what tells a merged entry apart from the file's prose comments.
-PLAN_BRANCHES=()
-PLAN_NUMBERS=()
-PLAN_TITLES=()
-PLAN_ACTIVE=()
-parse_plan_file() {
-	local plan_file="$1"
-	[[ -f "$plan_file" ]] || die "plan file not found: $plan_file"
-
-	PLAN_BRANCHES=()
-	PLAN_NUMBERS=()
-	PLAN_TITLES=()
-	PLAN_ACTIVE=()
-	local line body branch number title rest active
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		body="${line#"${line%%[![:space:]]*}"}" # ltrim
-		body="${body%"${body##*[![:space:]]}"}" # rtrim
-		[[ -n "$body" ]] || continue
-
-		active=1
-		if [[ "$body" == \#* ]]; then
-			active=0
-			# Strip the comment marker and the "[merged]" tag the merge
-			# driver prefixes, then see whether an entry is left.
-			body="${body#\#}"
-			body="${body#"${body%%[![:space:]]*}"}"
-			body="${body#\[merged\]}"
-			body="${body#"${body%%[![:space:]]*}"}"
-		fi
-
-		branch="${body%%[[:space:]]*}"
-		rest="${body#"$branch"}"
-		rest="${rest#"${rest%%[![:space:]]*}"}"
-		number="${rest%%[[:space:]]*}"
-		[[ "$number" =~ ^#[0-9]+$ ]] || continue
-		title="${rest#"$number"}"
-		title="${title#"${title%%[![:space:]]*}"}"
-
-		PLAN_BRANCHES+=("$branch")
-		PLAN_NUMBERS+=("${number#\#}")
-		PLAN_TITLES+=("$title")
-		PLAN_ACTIVE+=("$active")
-	done <"$plan_file"
-
-	[[ ${#PLAN_BRANCHES[@]} -gt 0 ]] || die "no plan entries found in $plan_file"
+# The plan as reviewing needs it: every entry in file order, merged ones
+# included — they are still links in the base chain, so the entry above one is
+# reviewed against it — and unparseable lines skipped rather than fatal, since
+# a plan file is prose as much as data. A file with no entries at all is an
+# error: every command here is about reviewing what the plan lists.
+load_plan() {
+	parse_plan_file --all "$1"
+	[[ ${#PLAN_BRANCHES[@]} -gt 0 ]] || die "no plan entries found in $1"
 }
 
 # plan_index_of <branch>
@@ -348,20 +291,10 @@ plan_parent_of() {
 # Output files
 # ---------------------------------------------------------------------------
 
-# review_slug <pr-number> <branch>
-#
-# Stable, filesystem-safe name for a branch's review directory. The PR number
-# goes first so a listing sorts into merge order.
-review_slug() {
-	local number="$1" branch="$2" slug
-	slug="${branch//\//-}"
-	slug="${slug//[^A-Za-z0-9._-]/-}"
-	if [[ -n "$number" ]]; then
-		printf '%s-%s' "$number" "$slug"
-	else
-		printf '%s' "$slug"
-	fi
-}
+# The directory names and the verdict file come from lib/review.sh: this tool
+# writes that tree and the merge gate reads it, so the layout is shared rather
+# than agreed by hand. The run files below are this tool's own business — the
+# gate only ever looks at the verdict.
 
 # set_review_paths <output-dir> <pr-number> <branch>
 #
@@ -396,8 +329,8 @@ set_run_files() {
 # to move onto a fresh one.
 set_review_paths() {
 	local dir="$1"
-	REVIEW_ROOT="$dir/$(review_slug "$2" "$3")"
-	REVIEW_LATEST="$REVIEW_ROOT/latest"
+	REVIEW_ROOT="$(review_root "$dir" "$2" "$3")"
+	REVIEW_LATEST="$(review_latest_dir "$dir" "$2" "$3")"
 	set_run_files "$REVIEW_LATEST"
 }
 
@@ -480,21 +413,6 @@ count_runs() {
 		n=$((n + 1))
 	done
 	printf '%s' "$n"
-}
-
-# read_verdict <verdict-file>
-#
-# Prints "true", "false", or "malformed"; nothing at all when the file is
-# missing. Whitespace around the value is tolerated, nothing else is: the
-# whole point of this file is that it needs no interpretation.
-read_verdict() {
-	local file="$1" value
-	[[ -f "$file" ]] || return 0
-	value="$(tr -d '[:space:]' <"$file" | tr '[:upper:]' '[:lower:]')"
-	case "$value" in
-	true | false) printf '%s' "$value" ;;
-	*) printf 'malformed' ;;
-	esac
 }
 
 # review_is_done <verdict-file>
@@ -990,7 +908,7 @@ cmd_review() {
 	require_tools
 	claim_worktree
 
-	parse_plan_file "$plan_file"
+	load_plan "$plan_file"
 	local idx
 	idx="$(plan_index_of "$branch")" ||
 		die "branch not listed in $plan_file: $branch"
@@ -1092,7 +1010,7 @@ cmd_review_all() {
 
 	require_tools
 	claim_worktree
-	parse_plan_file "$plan_file"
+	load_plan "$plan_file"
 
 	local root
 	root="$(git rev-parse --show-toplevel)"
@@ -1202,7 +1120,7 @@ cmd_status() {
 	done
 	[[ -n "$plan_file" ]] || usage 1
 
-	parse_plan_file "$plan_file"
+	load_plan "$plan_file"
 
 	local root
 	root="$(git rev-parse --show-toplevel)" || die "not inside a git repository"

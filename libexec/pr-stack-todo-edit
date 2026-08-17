@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# pr-stack-todo-edit — the sequence editor half of `pr-stack rebase`.
+#
+# Not a command: git invokes it as GIT_SEQUENCE_EDITOR, handing it the todo
+# file, and it hands the todo back with an `exec` line after each PR tip before
+# passing it on to the editor the user would have got anyway. It lives in
+# libexec rather than as a hidden verb on pr-stack because that is exactly what
+# it is — an executable for another program to call, not for a person.
+#
+# Its inputs arrive through the environment rather than argv, because git
+# appends the todo path to whatever GIT_SEQUENCE_EDITOR says and an editor
+# command is itself a shell string — nesting one inside the other survives
+# neither quoting nor an editor with spaces in its path:
+#
+#   PR_STACK_SPEC     file of boundary commit hashes, one per line; empty for
+#                     a plain rebase with nothing to inject
+#   PR_STACK_COMMAND  the command to run at each of them
+#   PR_STACK_EDITOR   the real sequence editor; empty to skip editing
+#
+# Boundaries are commits, not branches, and the command is told nothing about
+# which refs happen to sit on one. A commit can carry any number of branches —
+# the stack head always shares its commit with the topmost PR branch — so there
+# is no "the branch for this commit" to hand over. A command that wants the
+# names asks git for them itself, where it sees all of them rather than one
+# picked for it:
+#
+#     -x 'git for-each-ref --points-at HEAD --format="%(refname:short)" refs/heads'
+#
+# With the caveat that this answers only while the rebase is fast-forwarding
+# picks it does not need to rewrite. Once commits are genuinely rewritten the
+# branches still point at their pre-rebase commits — --update-refs applies the
+# whole set at the end — so nothing points at HEAD yet and the query comes back
+# empty. Checking an already-based stack sees its refs; rebasing onto a moved
+# base does not.
+#
+# Todo lines name commits abbreviated, so each pick is resolved back to a full
+# hash before it is looked up — abbreviations are not stable enough to compare
+# as text.
+#
+# The exec goes immediately after its pick, ahead of any `update-ref` lines
+# --update-refs put there. Those lines do not move a branch when they are
+# reached: git only records the intended update and applies the whole set once
+# the rebase completes, so during the exec the PR branch still points at its
+# pre-rebase commit either way. With the ref values identical, the exec belongs
+# next to the commit it is about.
+#
+set -euo pipefail
+
+# resolve_self <path>
+#
+# Absolute path to <path>, symlinks resolved where the system can do it:
+# `readlink -f` is GNU coreutils, so it is absent on macOS and on minimal
+# images. The fallback leaves symlinks unresolved, which is right in every case
+# but the one readlink was there for — an entry symlinked elsewhere, whose
+# siblings and assets then have to be looked for beside the symlink instead.
+resolve_self() {
+	local path="$1" resolved
+	if resolved="$(readlink -f "$path" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+		printf '%s' "$resolved"
+	else
+		printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+	fi
+}
+
+PREFIX="$(dirname "$(dirname "$(resolve_self "${BASH_SOURCE[0]}")")")"
+# die() is itself in common.sh, so failing to load it cannot be reported with it.
+# shellcheck source=../lib/common.sh
+. "$PREFIX/lib/common.sh" || {
+	printf 'error: cannot load %s\n' "$PREFIX/lib/common.sh" >&2
+	exit 1
+}
+
+# run_todo_editor <editor> <todo-file>
+#
+# Hands the todo to the real sequence editor, the way git would have. An empty
+# editor means --no-edit: leave the file alone. A non-zero exit propagates, and
+# git treats that as "abort the rebase" — which makes quitting the editor with
+# an error the natural way to call the whole thing off.
+run_todo_editor() {
+	local editor="$1" todo_file="$2"
+	[[ -n "$editor" ]] || return 0
+	# "$editor" is a command line, not a program name, so it goes through a
+	# shell — same as git does it.
+	sh -c "$editor \"\$@\"" "$editor" "$todo_file"
+}
+
+main() {
+	local todo_file="$1"
+	local spec_file="${PR_STACK_SPEC:-}" editor="${PR_STACK_EDITOR:-}"
+	local command="${PR_STACK_COMMAND:-}"
+
+	if [[ -z "$spec_file" ]]; then
+		# Plain rebase: nothing to inject, straight on to the editor.
+		run_todo_editor "$editor" "$todo_file"
+		return $?
+	fi
+
+	local -A is_boundary=()
+	local hash line
+
+	while read -r hash; do
+		[[ -n "$hash" ]] || continue
+		is_boundary["$hash"]=1
+	done <"$spec_file"
+
+	local out="" nl=$'\n' verb rest full
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		out+="$line$nl"
+
+		verb="${line%%[[:space:]]*}"
+		[[ "$verb" == "pick" || "$verb" == "p" ]] || continue
+
+		rest="${line#"$verb"}"
+		rest="${rest#"${rest%%[![:space:]]*}"}"
+		full="$(git rev-parse --verify --quiet "${rest%%[[:space:]]*}^{commit}" || true)"
+		[[ -n "$full" && -n "${is_boundary[$full]:-}" ]] || continue
+
+		out+="exec $command$nl"
+	done <"$todo_file"
+
+	printf '%s' "$out" >"$todo_file"
+
+	# The user reviews the todo *after* the execs are in it, so what they
+	# approve is what actually runs — and they can still reorder, drop or edit
+	# any of it, exec lines included.
+	run_todo_editor "$editor" "$todo_file"
+}
+
+[[ $# -eq 1 ]] || die "usage: pr-stack-todo-edit <todo-file> (git calls this, not you)"
+main "$1"
