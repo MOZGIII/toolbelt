@@ -64,6 +64,16 @@
 #       blocker, since it cannot merge either way. --no-wait-ci
 #       restores fail-fast behaviour for interactive use.
 #
+#       Cancelled checks get one nudge: when the checks settle with only
+#       cancellations and nothing actually failed, the wait cools down for
+#       --rerun-cooldown seconds (in case the cancellations are still
+#       trickling in) and then asks GitHub once to re-run the failed jobs of
+#       the affected workflow runs — GitHub's own "Re-run failed jobs",
+#       which covers cancelled jobs. If that round comes back cancelled too,
+#       something keeps killing the runs and asking again would only spin,
+#       so the train goes back to plain waiting. The one-shot memory is
+#       in-process only: a restarted run starts fresh and may ask once more.
+#
 #       Unresolved conversations gate by default, mirroring GitHub's own
 #       "all conversations resolved" branch protection; --allow-unresolved
 #       turns that gate off. It is read over GraphQL, the only place this
@@ -196,7 +206,8 @@ Commands:
              [--skip-approval] [--require-local-review] [--local-reviews-dir <path>]
              [--ci-interval <seconds>]
              [--ci-retry-interval <seconds>] [--ci-timeout <seconds>]
-             [--no-checks-timeout <seconds>] [--dry-run]
+             [--no-checks-timeout <seconds>] [--rerun-cooldown <seconds>]
+             [--dry-run]
              <plan-file> <map-file>
         Merge the first unmerged PR in the plan, then advance the map,
         rebase the stack, remap the branches and push. Re-run to resume
@@ -251,6 +262,14 @@ Commands:
                        (30s).
         --ci-retry-interval
                        delay between retries after a red round (120s).
+        --rerun-cooldown
+                       when the checks settle as cancelled with nothing
+                       actually failed, wait this long and then ask GitHub
+                       once to re-run the failed (i.e. cancelled) jobs
+                       (120s). A second round of cancellations is waited
+                       out, never re-run again; the request is remembered
+                       in memory only, so a fresh invocation may ask once
+                       more.
         --ci-timeout   give up after this long waiting for green; 0 (the
                        default) waits forever.
         --no-checks-timeout
@@ -772,10 +791,16 @@ local_review_label() {
 # poll_checks <pr-number> [--required]
 #
 # One non-interactive look at a PR's checks. Prints "<state><TAB><summary>",
-# where state is green | red | pending | none | error. Ignored checks are
-# dropped before the state is computed, so they can neither fail nor stall a
-# merge. "error" carries gh's own message and is a transient condition for
-# the caller to retry, not a verdict about the PR.
+# where state is green | red | pending | cancelled | none | error. Ignored
+# checks are dropped before the state is computed, so they can neither fail
+# nor stall a merge. "error" carries gh's own message and is a transient
+# condition for the caller to retry, not a verdict about the PR.
+#
+# "cancelled" is deliberately its own state rather than a flavour of red, and
+# deliberately conservative: it is reported only once nothing is pending and
+# nothing has actually failed, because it is what licenses the caller to
+# request an automatic re-run. A real failure alongside a cancellation is
+# red — re-running would just reproduce the failure.
 #
 # Deliberately does not use `gh pr checks --watch`: that renders a live
 # redrawing terminal UI, blocks for an unbounded time, and makes a mess of
@@ -808,7 +833,7 @@ poll_checks() {
 	rm -f "$err_file"
 
 	local bucket name
-	local fail=0 pending=0 pass=0 other=0 ignored=0
+	local fail=0 pending=0 pass=0 cancelled=0 other=0 ignored=0
 	local failing=()
 	while IFS=$'\t' read -r bucket name; do
 		[[ -n "$bucket" ]] || continue
@@ -817,7 +842,8 @@ poll_checks() {
 			continue
 		fi
 		case "$bucket" in
-		fail | cancel) fail=$((fail + 1)); failing+=("$name") ;;
+		fail) fail=$((fail + 1)); failing+=("$name") ;;
+		cancel) cancelled=$((cancelled + 1)) ;;
 		pending) pending=$((pending + 1)) ;;
 		pass) pass=$((pass + 1)) ;;
 		*) other=$((other + 1)) ;;
@@ -826,6 +852,7 @@ poll_checks() {
 
 	local summary
 	summary="$(printf '%d passed, %d failed, %d pending' "$pass" "$fail" "$pending")"
+	[[ "$cancelled" -gt 0 ]] && summary+=", $cancelled cancelled"
 	[[ "$other" -gt 0 ]] && summary+=", $other skipped"
 	[[ "$ignored" -gt 0 ]] && summary+=", $ignored ignored"
 
@@ -835,9 +862,66 @@ poll_checks() {
 		printf 'red\t%s — failing: %s' "$summary" "${joined%'; '}"
 	elif [[ "$pending" -gt 0 ]]; then
 		printf 'pending\t%s' "$summary"
+	elif [[ "$cancelled" -gt 0 ]]; then
+		printf 'cancelled\t%s' "$summary"
 	else
 		printf 'green\t%s' "$summary"
 	fi
+}
+
+# rerun_cancelled_jobs <pr-number> [--required]
+#
+# Ask GitHub to re-run the failed jobs of every workflow run that owns a
+# cancelled, non-ignored check on the PR — the API twin of the "Re-run failed
+# jobs" button, whose notion of "failed" covers cancelled jobs. Runs are
+# deduplicated by id, since one run usually owns several cancelled checks.
+# Checks that did not come from GitHub Actions carry no runs/<id> link and are
+# skipped: there is nothing of theirs to re-run here.
+#
+# Returns nonzero when no re-run was requested at all (the listing failed, no
+# Actions runs were behind the cancellations, or every request was refused —
+# a run still in progress, or a token without Actions write access). Each
+# refusal keeps gh's own stderr, which says why. The caller treats that the
+# same as a re-run that got cancelled again: keep waiting, do not retry.
+rerun_cancelled_jobs() {
+	local number="$1" required="${2:-}"
+	local args=(pr checks "$number" --json name,bucket,link)
+	[[ -n "$required" ]] && args+=(--required)
+
+	local rows
+	rows="$(gh_json "${args[@]}" \
+		--jq '.[] | select(.bucket == "cancel") | [.name, .link] | @tsv')" || {
+		printf 'warning: could not list the cancelled checks for a re-run\n' >&2
+		return 1
+	}
+
+	local name link run_id
+	local -A run_ids=()
+	while IFS=$'\t' read -r name link; do
+		[[ -n "$name" ]] || continue
+		check_is_ignored "$name" && continue
+		# .../actions/runs/<run-id>/job/<job-id>
+		run_id="${link##*/actions/runs/}"
+		run_id="${run_id%%/*}"
+		[[ "$run_id" =~ ^[0-9]+$ ]] || continue
+		run_ids["$run_id"]=1
+	done <<<"$rows"
+
+	if [[ ${#run_ids[@]} -eq 0 ]]; then
+		printf 'warning: no Actions workflow runs behind the cancelled checks — nothing to re-run\n' >&2
+		return 1
+	fi
+
+	local requested=0
+	for run_id in "${!run_ids[@]}"; do
+		if gh run rerun "$run_id" --failed </dev/null; then
+			note "requested a re-run of the failed jobs of run $run_id"
+			requested=$((requested + 1))
+		else
+			printf 'warning: could not re-run the failed jobs of run %s\n' "$run_id" >&2
+		fi
+	done
+	[[ "$requested" -gt 0 ]]
 }
 
 # load_ignore_checks_file <path>
@@ -887,6 +971,7 @@ cmd_merge_next() {
 	local base="main" stack="" remote="origin" merge_method="merge"
 	local skip_ci=0 skip_approval=0 dry_run=0 ci_interval=30 merge_timeout=300
 	local wait_ci=1 ci_retry_interval=120 ci_timeout=0 no_checks_timeout=900
+	local rerun_cooldown=120
 	local required_only=""
 	local require_local_review=0 local_reviews_dir="" allow_unresolved=0
 	local positional=()
@@ -900,6 +985,7 @@ cmd_merge_next() {
 		--ci-retry-interval) ci_retry_interval="${2:-}"; [[ -n "$ci_retry_interval" ]] || die "--ci-retry-interval requires a value"; shift 2 ;;
 		--ci-timeout) ci_timeout="${2:-}"; [[ -n "$ci_timeout" ]] || die "--ci-timeout requires a value"; shift 2 ;;
 		--no-checks-timeout) no_checks_timeout="${2:-}"; [[ -n "$no_checks_timeout" ]] || die "--no-checks-timeout requires a value"; shift 2 ;;
+		--rerun-cooldown) rerun_cooldown="${2:-}"; [[ -n "$rerun_cooldown" ]] || die "--rerun-cooldown requires a value"; shift 2 ;;
 		--merge-timeout) merge_timeout="${2:-}"; [[ -n "$merge_timeout" ]] || die "--merge-timeout requires a value"; shift 2 ;;
 		--wait-ci) wait_ci=1; shift ;;
 		--no-wait-ci) wait_ci=0; shift ;;
@@ -1034,6 +1120,11 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 		else
 			step "Waiting for PR #$number to become mergeable"
 			local checks ci_state summary waited_ci=0 no_checks_waited=0
+			# The cancelled-checks re-run is one-shot per invocation, and the
+			# memory of having asked is these two locals and nothing else: a
+			# restarted run starts fresh, which is the intended way to get a
+			# second nudge out of it.
+			local rerun_requested=0 cancelled_waited=0
 			local delay reason head_oid last_head=""
 			local status pr_now pr_draft pr_decision blocker unresolved
 			while :; do
@@ -1153,6 +1244,7 @@ merge without a local review verdict."
 					delay="$ci_interval"
 					reason="checks running ($summary)"
 					no_checks_waited=0
+					cancelled_waited=0
 					;;
 				red)
 					[[ "$wait_ci" -eq 1 ]] ||
@@ -1160,6 +1252,38 @@ merge without a local review verdict."
 							"Fix the failures and push, then re-run — or drop --no-wait-ci to keep waiting for a fix."
 					delay="$ci_retry_interval"
 					reason="checks red ($summary)"
+					no_checks_waited=0
+					cancelled_waited=0
+					;;
+				cancelled)
+					# Only cancellations, nothing actually failed — typically an
+					# interrupted or superseded run. After a cooldown (they may
+					# still be trickling in), ask GitHub once to re-run the
+					# failed jobs. If that round gets cancelled too, something
+					# keeps killing the runs and asking again would just spin,
+					# so it degrades to plain waiting, like a red build.
+					[[ "$wait_ci" -eq 1 ]] ||
+						die_resumable "CI checks were cancelled for PR #$number ($summary)" \
+							"Re-run the cancelled jobs on GitHub, then re-run — or drop --no-wait-ci to
+let the wait request that re-run itself after ${rerun_cooldown}s."
+					if [[ "$rerun_requested" -eq 1 ]]; then
+						delay="$ci_retry_interval"
+						reason="checks cancelled again after the requested re-run — waiting for a manual restart ($summary)"
+					elif [[ "$cancelled_waited" -lt "$rerun_cooldown" ]]; then
+						delay=$((rerun_cooldown - cancelled_waited))
+						[[ "$delay" -gt "$ci_interval" ]] && delay="$ci_interval"
+						reason="checks cancelled ($summary) — requesting a re-run in $((rerun_cooldown - cancelled_waited))s unless they recover"
+						cancelled_waited=$((cancelled_waited + delay))
+					else
+						rerun_requested=1
+						if rerun_cancelled_jobs "$number" "$required_only"; then
+							delay="$ci_interval"
+							reason="asked GitHub to re-run the cancelled jobs — waiting for them to start"
+						else
+							delay="$ci_retry_interval"
+							reason="could not request a re-run of the cancelled jobs — waiting for a manual restart"
+						fi
+					fi
 					no_checks_waited=0
 					;;
 				none)
@@ -1176,6 +1300,7 @@ If checks are just slow to register, raise --no-checks-timeout (0 waits forever)
 					delay="$ci_retry_interval"
 					reason="no checks reported yet"
 					no_checks_waited=$((no_checks_waited + delay))
+					cancelled_waited=0
 					;;
 				esac
 
