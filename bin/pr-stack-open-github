@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+#
+# pr-stack-open-github — open the PRs of a chained stack from a list of branch
+# names, bottom first, each one targeting the one before it.
+#
+# The list file has one entry per line; blank lines and whole-line "#"
+# comments are ignored. The FIRST entry is the base branch — the trunk, or
+# whatever the bottom PR is meant to target — on a line of its own. Every
+# following entry is a PR branch in stack order, bottom first, followed by the
+# title the PR is to get (the rest of the line, trimmed):
+#
+#     main
+#     mzg/2026-09-01/http              Core HTTP API machinery
+#     mzg/2026-09-01/lossy-batch-sink  Add lossy-batcher
+#     mzg/2026-09-01/events-pipeline   Add the observability events pipeline
+#
+# Every PR is opened onto the previous entry, with the title the list gives
+# it and a body of just "Goes in after #<previous PR>".
+#
+# For the bottom PR the "previous PR" is the base's own PR: when the base is
+# not the repository's default branch it is somebody's PR branch — the head of
+# an earlier chain, typically — and the bottom PR chains onto that PR exactly
+# like every other PR chains onto the one below it. Only a base that IS the
+# default branch has no PR, and only then does the bottom PR skip the line.
+#
+# Progress is kept in the plan-file format of lib/plan.sh ("<branch>  #<pr>
+# <title>", one per line), appended right after each successful create, so a
+# run interrupted mid-chain picks up where it stopped — and so the finished
+# file is exactly what pr-stack-merge-gh merge-all and pr-stack-review-claude
+# take as their plan. It defaults to "<list-file>.plan".
+#
+# Nothing is created unless every check below passes; the checks run over the
+# whole chain before the first gh pr create:
+#
+#   * every branch in the list exists locally and on the remote, and each PR
+#     branch's remote tip is at the local one (push first — pr-stack push).
+#     Nothing here changes the local branches: when some are missing, or the
+#     remote's tips are the ones to keep — a clone that never pushed the
+#     stack itself — the message prints the git commands to run;
+#   * the list is in git-history order: every entry is a strict ancestor of
+#     the entry after it (so the base sits under everything, and no branch
+#     shares a commit with or has been rebased past its neighbour);
+#   * no PR of any state exists from a PR branch that the progress file has
+#     not recorded — a PR created by hand, a re-used branch name, or a create
+#     that landed after the run was killed before it could be recorded; the
+#     message says which line to append if adopting that PR is what you want.
+#     the base branch is the exception, see the next point;
+#   * the base is the default branch, or has exactly one open PR — that PR
+#     is what the bottom PR goes in after, so without it the chain would be
+#     hanging off nothing. A closed or merged PR does not count: a base that
+#     has already merged is a rebase away from being the default branch;
+#   * every PR the progress file records is still open, from that branch and
+#     onto the base the list says it should have — the list and the progress
+#     file must agree, entry by entry, on what was already done.
+#
+# Usage:
+#
+#   pr-stack-open-github [--remote <name>] [--progress <file>] [--no-draft]
+#                       [--dry-run] <list-file>
+#
+#   --remote <name>     remote the branches are pushed to (default: origin)
+#   --progress <file>   progress / plan file (default: <list-file>.plan)
+#   --no-draft          open the PRs ready for review; by default they are
+#                       drafts, so a chain can be opened and looked over
+#                       before anyone is asked to review it
+#   --dry-run           run every check and print what would be created;
+#                       touches neither GitHub nor the progress file
+#
+set -euo pipefail
+
+# resolve_self <path>
+#
+# Absolute path to <path>, symlinks resolved where the system can do it:
+# `readlink -f` is GNU coreutils, so it is absent on macOS and on minimal
+# images. The fallback leaves symlinks unresolved, which is right in every case
+# but the one readlink was there for — a bin entry symlinked onto PATH, whose
+# siblings and assets then have to be looked for beside the symlink instead.
+resolve_self() {
+	local path="$1" resolved
+	if resolved="$(readlink -f "$path" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+		printf '%s' "$resolved"
+	else
+		printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+	fi
+}
+
+# bin/ and lib/ are siblings under a prefix, which the repo itself mirrors, so
+# this resolves the same way in a checkout as under an install tree.
+PREFIX="$(dirname "$(dirname "$(resolve_self "${BASH_SOURCE[0]}")")")"
+# die() is itself in common.sh, so failing to load it cannot be reported with it.
+for module in common plan; do
+	# shellcheck source=/dev/null
+	. "$PREFIX/lib/$module.sh" || {
+		printf 'error: cannot load %s\n' "$PREFIX/lib/$module.sh" >&2
+		exit 1
+	}
+done
+
+usage() {
+	cat >&2 <<'EOF'
+Usage: pr-stack-open-github [--remote <name>] [--progress <file>] [--no-draft]
+                           [--dry-run] <list-file>
+
+<list-file> names the base branch on its first line and the PR branches,
+bottom first, on the following ones. See the header of this script.
+EOF
+	exit 2
+}
+
+remote="origin"
+progress=""
+draft=1
+dry_run=0
+list_file=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--remote)
+		[[ $# -ge 2 ]] || usage
+		remote="$2"
+		shift 2
+		;;
+	--progress)
+		[[ $# -ge 2 ]] || usage
+		progress="$2"
+		shift 2
+		;;
+	--no-draft) draft=0; shift ;;
+	--dry-run) dry_run=1; shift ;;
+	-h | --help) usage ;;
+	-*) die "unknown option: $1" ;;
+	*)
+		[[ -z "$list_file" ]] || usage
+		list_file="$1"
+		shift
+		;;
+	esac
+done
+[[ -n "$list_file" ]] || usage
+[[ -f "$list_file" ]] || die "list file not found: $list_file"
+[[ -n "$progress" ]] || progress="$list_file.plan"
+
+command -v git >/dev/null || die "git is required but not on PATH"
+command -v gh >/dev/null || die "gh (GitHub CLI) is required but not on PATH"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+	die "not inside a git work tree (run this from the repository the branches live in)"
+
+# ---------------------------------------------------------------------------
+# The list.
+
+# branches[0] is the base; titles[] is parallel to branches[], with the base's
+# slot empty since the base gets no PR.
+branches=()
+titles=()
+lineno=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+	lineno=$((lineno + 1))
+	line="${line#"${line%%[![:space:]]*}"}" # ltrim
+	line="${line%"${line##*[![:space:]]}"}" # rtrim
+	[[ -n "$line" && "$line" != \#* ]] || continue
+	branch="${line%%[[:space:]]*}"
+	title="${line#"$branch"}"
+	title="${title#"${title%%[![:space:]]*}"}" # ltrim
+	if [[ ${#branches[@]} -eq 0 ]]; then
+		[[ -z "$title" ]] ||
+			die "$list_file:$lineno: the base branch takes no title, got \"$title\" after $branch"
+	else
+		[[ -n "$title" ]] ||
+			die "$list_file:$lineno: no PR title after $branch (format: <branch>  <PR title>)"
+	fi
+	branches+=("$branch")
+	titles+=("$title")
+done <"$list_file"
+
+[[ ${#branches[@]} -ge 2 ]] ||
+	die "$list_file must name the base branch and at least one PR branch"
+
+base="${branches[0]}"
+pr_branches=("${branches[@]:1}")
+pr_titles=("${titles[@]:1}")
+
+declare -A seen=()
+for b in "${branches[@]}"; do
+	[[ -z "${seen[$b]:-}" ]] || die "$list_file names $b twice"
+	seen["$b"]=1
+done
+
+# ---------------------------------------------------------------------------
+# Local existence.
+
+step "Checking local branches"
+
+declare -A local_sha=()
+missing=()
+for b in "${branches[@]}"; do
+	if sha="$(git rev-parse --verify -q "refs/heads/$b^{commit}")"; then
+		local_sha["$b"]="$sha"
+	else
+		missing+=("$b")
+	fi
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+	# The fetch form creates each branch at the remote's tip in one step,
+	# fetched or not; "git branch <b> <remote>/<b>" would need a fetch first
+	# and could pick up a stale remote-tracking ref.
+	printf 'error: not a local branch: %s\n' "${missing[*]}" >&2
+	printf '\nTo create them at the tips %s has:\n' "$remote" >&2
+	for b in "${missing[@]}"; do
+		printf '   git fetch %s %s:%s\n' "$remote" "$b" "$b" >&2
+	done
+	exit 1
+fi
+for b in "${branches[@]}"; do
+	note "$b ${local_sha[$b]:0:12}"
+done
+
+# ---------------------------------------------------------------------------
+# Order: every entry must be a strict ancestor of the next one.
+
+step "Checking that $list_file follows the git history"
+
+for ((i = 1; i < ${#branches[@]}; i++)); do
+	prev="${branches[$((i - 1))]}"
+	cur="${branches[$i]}"
+	[[ "${local_sha[$prev]}" != "${local_sha[$cur]}" ]] ||
+		die "$prev and $cur point at the same commit ${local_sha[$cur]:0:12}"
+	git merge-base --is-ancestor "$prev" "$cur" ||
+		die "$prev is not an ancestor of $cur: the list is not in git-history order (or the stack needs a rebase / remap)"
+done
+note "${#pr_branches[@]} PR branch(es) chained on top of $base, in order"
+
+# ---------------------------------------------------------------------------
+# Remote existence, and the remote being at the local tip.
+
+step "Checking branches on $remote"
+
+# One network round trip for all of them: ls-remote is read-only, so the local
+# remote-tracking refs — which may be stale — never enter into it.
+# Captured first, rather than read straight out of a process substitution:
+# the exit status of a <(...) never reaches the parent shell, so a failed
+# ls-remote would otherwise look like "every branch is missing".
+remote_refs="$(git ls-remote --heads "$remote" "${branches[@]}")" ||
+	die "git ls-remote $remote failed"
+declare -A remote_sha=()
+while read -r sha ref; do
+	[[ -n "$sha" ]] || continue
+	remote_sha["${ref#refs/heads/}"]="$sha"
+done <<<"$remote_refs"
+
+missing=()
+stale=()
+for b in "${branches[@]}"; do
+	if [[ -z "${remote_sha[$b]:-}" ]]; then
+		missing+=("$b")
+	elif [[ "$b" != "$base" && "${remote_sha[$b]}" != "${local_sha[$b]}" ]]; then
+		# The base only has to exist: it is typically the trunk, and where
+		# the local trunk sits has no bearing on the PRs. Every PR branch,
+		# though, was checked for order above using its *local* tip, so that
+		# is the tip GitHub has to see too.
+		stale+=("$b")
+	fi
+done
+[[ ${#missing[@]} -eq 0 ]] || die "not on $remote: ${missing[*]}"
+if [[ ${#stale[@]} -gt 0 ]]; then
+	printf 'error: remote tip differs from local tip for:\n' >&2
+	for b in "${stale[@]}"; do
+		printf '   %s (local %s, remote %s)\n' "$b" "${local_sha[$b]:0:12}" "${remote_sha[$b]:0:12}" >&2
+	done
+	printf '\nPush the branches first (pr-stack push <map-file>) and re-run; or, to take\n' >&2
+	printf '%s'"'"'s tips instead (fetch refuses to move a checked-out branch):\n' "$remote" >&2
+	for b in "${stale[@]}"; do
+		printf '   git fetch %s +%s:%s\n' "$remote" "$b" "$b" >&2
+	done
+	exit 1
+fi
+note "all ${#branches[@]} on $remote; PR branches at their local tips"
+
+# ---------------------------------------------------------------------------
+# The base's own PR: what the bottom PR goes in after, unless the base is the
+# default branch.
+
+step "Checking the base $base"
+
+default_branch="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' </dev/null)" ||
+	die "cannot read the repository's default branch"
+[[ -n "$default_branch" ]] || die "the repository reports no default branch"
+
+base_pr=""
+if [[ "$base" == "$default_branch" ]]; then
+	note "$base is the default branch; the bottom PR goes in after nothing"
+else
+	base_prs="$(gh pr list --head "$base" --state open --limit 20 --json number,baseRefName,title \
+		--jq '.[] | "#\(.number) -> \(.baseRefName)  \(.title)"' </dev/null)" ||
+		die "failed to query PRs from $base"
+	if [[ -z "$base_prs" ]]; then
+		die "$base is not the default branch ($default_branch) and has no open PR: the bottom PR would go in after nothing. Open a PR for $base first, or chain onto $default_branch"
+	elif [[ "$(printf '%s\n' "$base_prs" | wc -l)" -ne 1 ]]; then
+		printf 'error: %s has more than one open PR:\n' "$base" >&2
+		printf '%s\n' "$base_prs" | sed 's/^/   /' >&2
+		die "cannot tell which one the bottom PR goes in after"
+	fi
+	base_pr="${base_prs#\#}"
+	base_pr="${base_pr%% *}"
+	[[ "$base_pr" =~ ^[0-9]+$ ]] || die "could not read a PR number out of \"$base_prs\""
+	note "$base_prs"
+	note "the bottom PR goes in after #$base_pr"
+fi
+
+# ---------------------------------------------------------------------------
+# Progress so far: a prefix of the PR branches, each with a PR that is still
+# what the list says it is.
+
+step "Checking progress in $progress"
+
+done_numbers=()
+if [[ -f "$progress" ]]; then
+	parse_plan_file --strict "$progress"
+	[[ ${#PLAN_BRANCHES[@]} -le ${#pr_branches[@]} ]] ||
+		die "$progress records ${#PLAN_BRANCHES[@]} PR(s) but $list_file has only ${#pr_branches[@]} PR branches"
+	for i in "${!PLAN_BRANCHES[@]}"; do
+		branch="${PLAN_BRANCHES[$i]}"
+		number="${PLAN_NUMBERS[$i]}"
+		[[ "$branch" == "${pr_branches[$i]}" ]] ||
+			die "$progress entry $((i + 1)) is $branch but $list_file has ${pr_branches[$i]} there: the list changed under the progress file"
+		expected_base="${branches[$i]}"
+
+		info="$(gh pr view "$number" --json state,headRefName,baseRefName \
+			--jq '"\(.state) \(.headRefName) \(.baseRefName)"' </dev/null)" ||
+			die "cannot read PR #$number (recorded for $branch)"
+		read -r state head pr_base <<<"$info"
+		[[ "$head" == "$branch" ]] ||
+			die "PR #$number is from $head, but $progress records it for $branch"
+		[[ "$state" == "OPEN" ]] ||
+			die "PR #$number ($branch) is $state, not open"
+		[[ "$pr_base" == "$expected_base" ]] ||
+			die "PR #$number ($branch) targets $pr_base, but the chain says $expected_base"
+		done_numbers+=("$number")
+		note "#$number $branch -> $expected_base (already open)"
+	done
+else
+	note "no progress file yet; starting from the bottom"
+fi
+first=${#done_numbers[@]}
+
+# ---------------------------------------------------------------------------
+# No PR may exist, in any state, from a branch still to be done.
+
+step "Checking that the remaining branches have no PRs"
+
+offending=0
+for ((i = first; i < ${#pr_branches[@]}; i++)); do
+	b="${pr_branches[$i]}"
+	existing="$(gh pr list --head "$b" --state all --limit 20 \
+		--json number,state,baseRefName,title \
+		--jq '.[] | "#\(.number) \(.state) -> \(.baseRefName)  \(.title)"' </dev/null)" ||
+		die "failed to query PRs from $b"
+	if [[ -n "$existing" ]]; then
+		offending=1
+		printf 'error: PR(s) already exist from %s:\n' "$b" >&2
+		printf '%s\n' "$existing" | sed 's/^/   /' >&2
+	fi
+done
+if [[ "$offending" -eq 1 ]]; then
+	printf '\n' >&2
+	printf 'If one of these is the PR this run should have recorded, append\n' >&2
+	printf '   <branch>  #<pr-number>  <title>\n' >&2
+	printf 'for it to %s and re-run; otherwise close it first.\n' "$progress" >&2
+	exit 1
+fi
+note "none"
+
+# ---------------------------------------------------------------------------
+# Create.
+
+if [[ "$first" -eq ${#pr_branches[@]} ]]; then
+	step "Nothing to do"
+	note "all ${#pr_branches[@]} PR(s) are recorded in $progress"
+	exit 0
+fi
+
+if [[ "$dry_run" -eq 1 ]]; then
+	step "Dry run: would open"
+else
+	step "Opening PRs"
+fi
+
+if [[ ! -f "$progress" && "$dry_run" -eq 0 ]]; then
+	{
+		printf '# PR chain opened from %s (base %s)\n' "$list_file" "$base"
+		printf '#\n'
+		printf '# Format: <branch-name>  #<pr-number>  <pr-title>\n'
+		printf '# Whole-line "#" comments only. Written by pr-stack-open-github.\n'
+		printf '\n'
+	} >"$progress"
+fi
+
+for ((i = first; i < ${#pr_branches[@]}; i++)); do
+	b="${pr_branches[$i]}"
+	pr_base="${branches[$i]}"
+
+	title="${pr_titles[$i]}"
+
+	# In a dry run nothing gets a number, so past the first PR to be created
+	# the previous number is only a placeholder.
+	if [[ "$i" -eq 0 ]]; then
+		after="$base_pr"
+	else
+		after="${done_numbers[$((i - 1))]}"
+		[[ -n "$after" ]] || after="<previous>"
+	fi
+
+	body=""
+	[[ -z "$after" ]] || body="Goes in after #$after"
+
+	if [[ "$dry_run" -eq 1 ]]; then
+		note "$b -> $pr_base: \"$title\"${after:+ (Goes in after #$after)}"
+		done_numbers+=("")
+		continue
+	fi
+
+	create_args=(--base "$pr_base" --head "$b" --title "$title" --body "$body")
+	[[ "$draft" -eq 0 ]] || create_args+=(--draft)
+	url="$(gh pr create "${create_args[@]}" </dev/null)" ||
+		die "gh pr create failed for $b; if the PR was created anyway, record it in $progress and re-run"
+	number="${url##*/}"
+	[[ "$number" =~ ^[0-9]+$ ]] ||
+		die "could not read a PR number out of \"$url\"; find the PR for $b, record it in $progress and re-run"
+
+	printf '%s  #%s  %s\n' "$b" "$number" "$title" >>"$progress"
+	done_numbers+=("$number")
+	note "#$number $b -> $pr_base  $url"
+done
+
+if [[ "$dry_run" -eq 0 ]]; then
+	printf '\n%sDone.%s %d PR(s) recorded in %s\n' "$BOLD" "$RESET" "${#done_numbers[@]}" "$progress"
+fi
