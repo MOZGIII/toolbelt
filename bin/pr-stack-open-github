@@ -39,7 +39,10 @@
 #     stack itself — the message prints the git commands to run;
 #   * the list is in git-history order: every entry is a strict ancestor of
 #     the entry after it (so the base sits under everything, and no branch
-#     shares a commit with or has been rebased past its neighbour);
+#     shares a commit with or has been rebased past its neighbour). A local
+#     branch left behind by a rebase fails this too, so the message also
+#     prints the forced fetches that take the remote's tips for every PR
+#     branch in the list;
 #   * no PR of any state exists from a PR branch that the progress file has
 #     not recorded — a PR created by hand, a re-used branch name, or a create
 #     that landed after the run was killed before it could be recorded; the
@@ -223,8 +226,19 @@ for ((i = 1; i < ${#branches[@]}; i++)); do
 	cur="${branches[$i]}"
 	[[ "${local_sha[$prev]}" != "${local_sha[$cur]}" ]] ||
 		die "$prev and $cur point at the same commit ${local_sha[$cur]:0:12}"
-	git merge-base --is-ancestor "$prev" "$cur" ||
-		die "$prev is not an ancestor of $cur: the list is not in git-history order (or the stack needs a rebase / remap)"
+	git merge-base --is-ancestor "$prev" "$cur" || {
+		# Either the list is wrong, or a local branch is behind the remote:
+		# a clone that last fetched the stack before a rebase still has the
+		# old tip, and a plain fetch refuses to move it there. Print the
+		# forced form for the whole list so one paste brings the clone up.
+		printf 'error: %s is not an ancestor of %s: the list is not in git-history order\n' "$prev" "$cur" >&2
+		printf '(or the stack needs a rebase / remap, or these local branches are behind %s)\n' "$remote" >&2
+		printf '\nTo take %s'"'"'s tips for the whole list (fetch refuses to move a checked-out branch):\n' "$remote" >&2
+		for b in "${pr_branches[@]}"; do
+			printf '   git fetch %s +%s:%s\n' "$remote" "$b" "$b" >&2
+		done
+		exit 1
+	}
 done
 note "${#pr_branches[@]} PR branch(es) chained on top of $base, in order"
 
