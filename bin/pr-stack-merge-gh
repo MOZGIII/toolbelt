@@ -1103,7 +1103,7 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 
 		if [[ "$dry_run" -eq 1 ]]; then
 			step "Dry run"
-			note "would wait for approval and CI, merge #$number with --$merge_method, then:"
+			note "would wait for approval and CI, merge #$number via the REST merge endpoint ($merge_method), then:"
 			note "  $PR_STACK advance --remote $remote --base $base $map_file"
 			note "  git rebase $base $stack"
 			note "  $PR_STACK remap --apply --base $base $map_file $stack"
@@ -1333,10 +1333,17 @@ If checks are just slow to register, raise --no-checks-timeout (0 waits forever)
 				verify_stack_sync "$map_file" "$base" "$stack" "$branch" "$remote"
 			fi
 
-			step "Merging PR #$number via GitHub (--$merge_method)"
-			gh pr merge "$number" "--$merge_method" </dev/null ||
-				die_resumable "gh pr merge failed for #$number" \
-					"If the PR needs approvals or is blocked, resolve it on GitHub, then re-run.
+			step "Merging PR #$number via GitHub ($merge_method)"
+			# The REST merge endpoint, not `gh pr merge`: gh first reads the PR's
+			# cached mergeStateStatus and, on BLOCKED, refuses client-side without
+			# ever asking GitHub — and that cache is routinely stale right after
+			# the last check turns green (the web UI merges the same PR fine).
+			# The endpoint lets the server rule on the live state, and when it
+			# does refuse, its 405 body names the unmet requirement.
+			gh api -X PUT "repos/{owner}/{repo}/pulls/$number/merge" \
+				-f merge_method="$merge_method" --jq .message </dev/null ||
+				die_resumable "the merge request for #$number was refused" \
+					"GitHub's reply above names the unmet requirement: fix it on the PR, then re-run.
 If it failed with \"Resource not accessible by personal access token\", the gh
 token cannot write to this repo: use a classic PAT (repo scope) via GH_TOKEN,
 or run \`gh auth login --hostname github.com --web\`."
