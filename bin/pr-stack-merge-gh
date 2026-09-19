@@ -94,6 +94,13 @@
 #       earlier local-vs-remote check. A PR merged or closed by someone
 #       else while waiting is noticed and handled rather than fought.
 #
+#       A hold file — <reviews-dir>/<pr>-<branch-slug>/hold, see lib/review.sh
+#       — is a fourth gate, and unlike the third it is always on: a hold is
+#       the operator saying "not this one yet", so it holds whether or not
+#       --require-local-review is given and whatever the verdict says. It is
+#       waited on like the others, so `unhold` releases the train in place.
+#       `hold` and `unhold` write and remove the file for a PR in the plan.
+#
 # Plan file format: "<branch-name>  #<pr-number>  <pr-title>", one per line.
 # Unlike map files, only whole-line "#" comments are recognised (a PR number
 # is spelled "#490", so trailing comments would be ambiguous).
@@ -227,6 +234,9 @@ Commands:
                        false or malformed verdict blocks the merge. Like
                        the other gates this is waited on, not aborted at,
                        so reviewing in another terminal releases the train.
+                       A hold file (<pr>-<branch-slug>/hold, see the hold
+                       command) blocks the merge regardless of this flag
+                       and of the verdict, and is waited on the same way.
         --local-reviews-dir <path>
                        where those reviews live (default:
                        <repo-root>/.reviews). Implies --require-local-review.
@@ -282,9 +292,25 @@ Commands:
         Show the plan's progress: merged entries, what is up next, and three
         review columns per remaining PR — its GitHub review state, its
         unresolved review conversations, and the verdict of its newest local
-        review run: the same three gates merge-next waits on. Costs two API
-        calls per PR; a failed query shows "?" rather than aborting, since it
-        says nothing about the PR either way.
+        review run (or "held" when a hold file is in place): the gates
+        merge-next waits on. Costs two API calls per PR; a failed query
+        shows "?" rather than aborting, since it says nothing about the PR
+        either way.
+
+  hold [--local-reviews-dir <path>] <plan-file> <pr-number> [<reason>...]
+        Hold a PR in the plan back from merging: writes
+        <reviews-dir>/<pr>-<branch-slug>/hold with the reason as its
+        first line. merge-next waits on the file whatever the review
+        verdict says and whether or not --require-local-review is given;
+        status shows the PR as "held". Re-running replaces the reason.
+        Nothing on GitHub is touched.
+
+  unhold [--local-reviews-dir <path>] <plan-file> <pr-number>
+        Remove that hold. A merge-next already waiting on it carries on
+        without a restart.
+
+  holds [--local-reviews-dir <path>] <plan-file>
+        List the plan's held PRs with their reasons.
 
         --local-reviews-dir <path>
                        where the local reviews live (default:
@@ -497,7 +523,7 @@ cmd_status() {
 	printf '\nUp next:\n'
 	printf '     %-11s %-10s %-8s %-6s %-*s %s\n' \
 		'github' 'local' 'threads' 'pr' "$width" 'branch' 'title'
-	local marker label local_label thread_label approved=0 reviewed=0 resolved=0
+	local marker label local_label thread_label approved=0 reviewed=0 resolved=0 held=0
 	local status pr_state pr_draft pr_decision unresolved
 	for i in "${!PLAN_BRANCHES[@]}"; do
 		if [[ $i -eq 0 ]]; then marker="->"; else marker="  "; fi
@@ -517,13 +543,107 @@ cmd_status() {
 		local_label="$(local_review_label "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
 		[[ "$label" == "approved" ]] && approved=$((approved + 1))
 		[[ "$local_label" == "ready" ]] && reviewed=$((reviewed + 1))
+		[[ "$local_label" == "held" ]] && held=$((held + 1))
 		[[ "$thread_label" == "resolved" ]] && resolved=$((resolved + 1))
 		printf '  %s %-11s %-10s %-8s #%-5s %-*s %s\n' \
 			"$marker" "$label" "$local_label" "$thread_label" "${PLAN_NUMBERS[$i]}" \
 			"$width" "${PLAN_BRANCHES[$i]}" "${PLAN_TITLES[$i]}"
 	done
-	printf '\n%d of %d approved, %d locally reviewed, %d fully resolved.\n' \
-		"$approved" "${#PLAN_BRANCHES[@]}" "$reviewed" "$resolved"
+	printf '\n%d of %d approved, %d locally reviewed, %d fully resolved, %d held.\n' \
+		"$approved" "${#PLAN_BRANCHES[@]}" "$reviewed" "$resolved" "$held"
+}
+
+# ---------------------------------------------------------------------------
+# hold / unhold / holds
+# ---------------------------------------------------------------------------
+
+# plan_branch_for <plan-file> <pr-number>
+#
+# The branch the plan lists for a PR; dies when the PR is not in the plan,
+# since a hold on a PR the train will never visit is a typo, not a hold.
+plan_branch_for() {
+	local plan_file="$1" number="$2" i
+	parse_plan_file --strict "$plan_file"
+	for i in "${!PLAN_NUMBERS[@]}"; do
+		if [[ "${PLAN_NUMBERS[$i]}" == "$number" ]]; then
+			printf '%s' "${PLAN_BRANCHES[$i]}"
+			return 0
+		fi
+	done
+	die "PR #$number is not in $plan_file (merged entries are commented out and cannot be held)"
+}
+
+# parse_hold_args <mode> <args...>
+#
+# Shared option parsing for the three hold commands: mode is "hold"
+# (plan, number, optional reason words), "unhold" (plan, number) or "holds"
+# (plan). Leaves HOLD_PLAN, HOLD_NUMBER, HOLD_REASON, HOLD_DIR set.
+parse_hold_args() {
+	local mode="$1"; shift
+	HOLD_PLAN="" HOLD_NUMBER="" HOLD_REASON="" HOLD_DIR=""
+	local positional=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--local-reviews-dir) HOLD_DIR="${2:-}"; [[ -n "$HOLD_DIR" ]] || die "--local-reviews-dir requires a value"; shift 2 ;;
+		-h | --help) usage 0 ;;
+		--) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done ;;
+		-*) die "unknown option: $1" ;;
+		*) positional+=("$1"); shift ;;
+		esac
+	done
+	[[ ${#positional[@]} -ge 1 ]] || usage 1
+	HOLD_PLAN="${positional[0]}"
+	[[ -f "$HOLD_PLAN" ]] || die "plan file not found: $HOLD_PLAN"
+	case "$mode" in
+	holds) [[ ${#positional[@]} -eq 1 ]] || usage 1 ;;
+	unhold) [[ ${#positional[@]} -eq 2 ]] || usage 1; HOLD_NUMBER="${positional[1]}" ;;
+	hold)
+		[[ ${#positional[@]} -ge 2 ]] || usage 1
+		HOLD_NUMBER="${positional[1]}"
+		HOLD_REASON="${positional[*]:2}"
+		;;
+	esac
+	if [[ -n "$HOLD_NUMBER" ]]; then
+		HOLD_NUMBER="${HOLD_NUMBER#\#}"
+		[[ "$HOLD_NUMBER" =~ ^[0-9]+$ ]] || die "not a PR number: $HOLD_NUMBER"
+	fi
+	[[ -n "$HOLD_DIR" ]] || HOLD_DIR="$(git rev-parse --show-toplevel)/.reviews"
+}
+
+cmd_hold() {
+	parse_hold_args hold "$@"
+	local branch hold_file
+	branch="$(plan_branch_for "$HOLD_PLAN" "$HOLD_NUMBER")"
+	hold_file="$(review_hold_file "$HOLD_DIR" "$HOLD_NUMBER" "$branch")"
+	mkdir -p "$(dirname "$hold_file")"
+	printf '%s\n' "${HOLD_REASON:-held}" >"$hold_file"
+	printf 'held #%s (%s): %s\n  %s\n' "$HOLD_NUMBER" "$branch" "${HOLD_REASON:-held}" "$hold_file"
+}
+
+cmd_unhold() {
+	parse_hold_args unhold "$@"
+	local branch hold_file
+	branch="$(plan_branch_for "$HOLD_PLAN" "$HOLD_NUMBER")"
+	hold_file="$(review_hold_file "$HOLD_DIR" "$HOLD_NUMBER" "$branch")"
+	if [[ -f "$hold_file" ]]; then
+		rm -f -- "$hold_file"
+		printf 'released #%s (%s)\n' "$HOLD_NUMBER" "$branch"
+	else
+		printf '#%s (%s) was not held\n' "$HOLD_NUMBER" "$branch"
+	fi
+}
+
+cmd_holds() {
+	parse_hold_args holds "$@"
+	parse_plan_file --strict "$HOLD_PLAN"
+	local i reason count=0
+	for i in "${!PLAN_NUMBERS[@]}"; do
+		reason="$(read_hold "$(review_hold_file "$HOLD_DIR" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}")")"
+		[[ -n "$reason" ]] || continue
+		count=$((count + 1))
+		printf '  #%-5s %s\n         %s\n' "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$reason"
+	done
+	[[ "$count" -gt 0 ]] || printf 'No holds.\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -752,7 +872,12 @@ unresolved_label() {
 # without restarting it.
 local_review_blocker() {
 	local number="$1" branch="$2" dir="$3"
-	local verdict_file value
+	local verdict_file value held
+	held="$(hold_blocker "$number" "$branch" "$dir")"
+	if [[ -n "$held" ]]; then
+		printf '%s' "$held"
+		return 0
+	fi
 	verdict_file="$(review_verdict_file "$dir" "$number" "$branch")"
 
 	if [[ ! -f "$verdict_file" ]]; then
@@ -771,6 +896,20 @@ local_review_blocker() {
 	esac
 }
 
+# hold_blocker <pr-number> <branch> <reviews-dir>
+#
+# Prints why the hold file does not clear this PR for merging — its reason and
+# where the file is — or nothing when there is no hold. Checked before the
+# verdict: a hold outranks a "true", which is the whole point of it.
+hold_blocker() {
+	local number="$1" branch="$2" dir="$3"
+	local hold_file reason
+	hold_file="$(review_hold_file "$dir" "$number" "$branch")"
+	reason="$(read_hold "$hold_file")"
+	[[ -n "$reason" ]] || return 0
+	printf 'held — %s (%s)' "$reason" "$hold_file"
+}
+
 # local_review_label <pr-number> <branch> <reviews-dir>
 #
 # The column form of local_review_blocker, for the same reason review_label is
@@ -779,6 +918,10 @@ local_review_blocker() {
 local_review_label() {
 	local number="$1" branch="$2" dir="$3"
 	local verdict
+	if [[ -n "$(read_hold "$(review_hold_file "$dir" "$number" "$branch")")" ]]; then
+		printf 'held'
+		return 0
+	fi
 	verdict="$(read_verdict "$(review_verdict_file "$dir" "$number" "$branch")")"
 	case "$verdict" in
 	true) printf 'ready' ;;
@@ -1005,9 +1148,9 @@ cmd_merge_next() {
 		esac
 	done
 	[[ ${#positional[@]} -eq 2 ]] || usage 1
-	if [[ "$require_local_review" -eq 1 && -z "$local_reviews_dir" ]]; then
-		local_reviews_dir="$(git rev-parse --show-toplevel)/.reviews"
-	fi
+	# The hold gate reads the same tree whether or not the verdict gate is on,
+	# so the directory is resolved unconditionally.
+	[[ -n "$local_reviews_dir" ]] || local_reviews_dir="$(git rev-parse --show-toplevel)/.reviews"
 	local plan_file="${positional[0]}" map_file="${positional[1]}"
 	[[ -f "$plan_file" ]] || die "plan file not found: $plan_file"
 	[[ -f "$map_file" ]] || die "map file not found: $map_file"
@@ -1116,6 +1259,11 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 		local ci_rounds=0
 		if [[ "$skip_ci" -eq 1 && "$skip_approval" -eq 1 && "$require_local_review" -eq 0 &&
 			"$allow_unresolved" -eq 1 ]]; then
+			# Every wait is switched off — except a hold, which no flag skips.
+			local held
+			held="$(hold_blocker "$number" "$branch" "$local_reviews_dir")"
+			[[ -z "$held" ]] || die_resumable "PR #$number is not ready to merge: $held" \
+				"Run: $0 unhold $plan_file $number — then re-run."
 			step "Skipping the approval, conversation and CI waits (--skip-approval --allow-unresolved --skip-ci)"
 		else
 			step "Waiting for PR #$number to become mergeable"
@@ -1157,8 +1305,12 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 				local blockers=() local_blocker="" approval="" conversations=""
 				if [[ "$require_local_review" -eq 1 ]]; then
 					local_blocker="$(local_review_blocker "$number" "$branch" "$local_reviews_dir")"
-					[[ -z "$local_blocker" ]] || blockers+=("local review: $local_blocker")
+				else
+					# No verdict gate, but a hold is the operator's word and
+					# holds regardless.
+					local_blocker="$(hold_blocker "$number" "$branch" "$local_reviews_dir")"
 				fi
+				[[ -z "$local_blocker" ]] || blockers+=("local review: $local_blocker")
 				if [[ "$allow_unresolved" -eq 0 ]]; then
 					if unresolved="$(poll_unresolved_threads "$number")"; then
 						conversations="$(unresolved_blocker "$unresolved")"
@@ -1495,6 +1647,9 @@ merge-next) cmd_merge_next "$@" ;;
 merge-all) cmd_merge_all "$@" ;;
 status) cmd_status "$@" ;;
 checks) cmd_checks "$@" ;;
+hold) cmd_hold "$@" ;;
+unhold) cmd_unhold "$@" ;;
+holds) cmd_holds "$@" ;;
 -h | --help) usage 0 ;;
-*) die "unknown command: $command (expected 'plan', 'merge-next', 'merge-all', 'status', or 'checks')" ;;
+*) die "unknown command: $command (expected 'plan', 'merge-next', 'merge-all', 'status', 'checks', 'hold', 'unhold' or 'holds')" ;;
 esac

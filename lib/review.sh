@@ -12,8 +12,17 @@
 #       001/ …            one directory per run; nothing is ever overwritten
 #       002/ …
 #       latest -> 002     symlink onto the newest run
+#       hold              optional: while present, the PR is held back from
+#                         merging whatever the verdict says; its first line
+#                         is the reason
 #
 # The verdict of record is <latest>/verdict, holding "true" or "false".
+#
+# The hold is the operator's file, not the reviewer's: a review run neither
+# creates nor removes it. It exists because a verdict of "true" means "no
+# blocking finding", which is not the same as "nothing left to decide" — a
+# question the reviewer carried as non-blocking, a ruling still owed, a fix
+# queued but not landed, all leave the verdict true and the PR not ready.
 
 # review_slug <pr-number> <branch>
 #
@@ -45,6 +54,22 @@ review_latest_dir() {
 # review_verdict_file <reviews-dir> <pr-number> <branch>
 review_verdict_file() {
 	printf '%s/verdict' "$(review_latest_dir "$@")"
+}
+
+# review_hold_file <reviews-dir> <pr-number> <branch>
+review_hold_file() {
+	printf '%s/hold' "$(review_root "$@")"
+}
+
+# read_hold <hold-file>
+#
+# The hold's reason — its first non-blank line, or "held" when the file is
+# empty — and nothing at all when there is no hold.
+read_hold() {
+	local file="$1" reason
+	[[ -f "$file" ]] || return 0
+	reason="$(grep -m1 -v '^[[:space:]]*$' "$file" || true)"
+	printf '%s' "${reason:-held}"
 }
 
 # normalize_verdict <verdict-file>
