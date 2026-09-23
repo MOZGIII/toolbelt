@@ -142,6 +142,17 @@ require_tools() {
 		printf 'note: jq is not on PATH — reviews still run, but there is no live progress to watch\n' >&2
 }
 
+# require_model
+#
+# Every review command runs this before it touches the worktree. There is no
+# default model on purpose: a review is judged with the model in mind, so the
+# choice is made per run rather than inherited from whatever this script last
+# shipped with.
+require_model() {
+	[[ "$MODEL_SET" -eq 1 ]] ||
+		die "--model is required; pass an empty string to leave the model to claude"
+}
+
 usage() {
 	cat >&2 <<'EOF'
 Usage: pr-stack-review-claude <command> [options] [args]
@@ -193,9 +204,9 @@ Options (all review commands):
                        review.md and verdict.
   --prompt-file <path> prompt template (default: share/prompts/code-review.md
                        under this script's prefix)
-  --model <name>       passed to claude --model (default: fable); pass an
-                       empty string to leave the model unset and take
-                       whatever claude defaults to
+  --model <name>       passed to claude --model; required, there is no
+                       default. Pass an empty string to leave the model
+                       unset and take whatever claude defaults to
   --effort <level>     passed to claude --effort
   --permission-mode <mode>
                        passed to claude --permission-mode
@@ -583,7 +594,11 @@ ALLOWED_TOOLS=(
 )
 TOOL_LIMITS=1
 PERMISSION_MODE="acceptEdits"
-MODEL="fable"
+# The model is always the caller's choice: there is no default, and the
+# review commands refuse to run until --model has been given. MODEL_SET is what
+# records that, since the empty string is itself a valid choice (see --model).
+MODEL=""
+MODEL_SET=0
 EFFORT=""
 TIMEOUT=0
 DRY_RUN=0
@@ -792,6 +807,7 @@ parse_common_opt() {
 		# so this checks that an argument is present, not that it is non-empty.
 		[[ $# -ge 2 ]] || die "--model requires a value"
 		MODEL="$2"
+		MODEL_SET=1
 		;;
 	--effort)
 		EFFORT="${2:-}"
@@ -906,6 +922,7 @@ cmd_review() {
 	local plan_file="${positional[0]}" branch="${positional[1]}"
 
 	require_tools
+	require_model
 	claim_worktree
 
 	load_plan "$plan_file"
@@ -956,6 +973,7 @@ cmd_review_standalone() {
 	[[ -n "$branch" ]] || usage 1
 
 	require_tools
+	require_model
 	claim_worktree
 
 	REVIEW_KIND="standalone"
@@ -1009,6 +1027,7 @@ cmd_review_all() {
 		die "--failed and --force contradict each other: --failed re-reviews by verdict, --force regardless of it; to redo passed reviews too, drop --failed"
 
 	require_tools
+	require_model
 	claim_worktree
 	load_plan "$plan_file"
 
