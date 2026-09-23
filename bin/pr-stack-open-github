@@ -40,9 +40,11 @@
 #   * the list is in git-history order: every entry is a strict ancestor of
 #     the entry after it (so the base sits under everything, and no branch
 #     shares a commit with or has been rebased past its neighbour). A local
-#     branch left behind by a rebase fails this too, so the message also
-#     prints the forced fetches that take the remote's tips for every PR
-#     branch in the list;
+#     branch left behind by a rebase fails this too — the base as much as
+#     any PR branch — so the message names every listed branch whose local
+#     tip differs from the remote's and prints the forced fetches for
+#     exactly those; when none differs, it says so instead of hinting at a
+#     fetch that would change nothing;
 #   * no PR of any state exists from a PR branch that the progress file has
 #     not recorded — a PR created by hand, a re-used branch name, or a create
 #     that landed after the run was killed before it could be recorded; the
@@ -217,33 +219,9 @@ for b in "${branches[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Order: every entry must be a strict ancestor of the next one.
-
-step "Checking that $list_file follows the git history"
-
-for ((i = 1; i < ${#branches[@]}; i++)); do
-	prev="${branches[$((i - 1))]}"
-	cur="${branches[$i]}"
-	[[ "${local_sha[$prev]}" != "${local_sha[$cur]}" ]] ||
-		die "$prev and $cur point at the same commit ${local_sha[$cur]:0:12}"
-	git merge-base --is-ancestor "$prev" "$cur" || {
-		# Either the list is wrong, or a local branch is behind the remote:
-		# a clone that last fetched the stack before a rebase still has the
-		# old tip, and a plain fetch refuses to move it there. Print the
-		# forced form for the whole list so one paste brings the clone up.
-		printf 'error: %s is not an ancestor of %s: the list is not in git-history order\n' "$prev" "$cur" >&2
-		printf '(or the stack needs a rebase / remap, or these local branches are behind %s)\n' "$remote" >&2
-		printf '\nTo take %s'"'"'s tips for the whole list (fetch refuses to move a checked-out branch):\n' "$remote" >&2
-		for b in "${pr_branches[@]}"; do
-			printf '   git fetch %s +%s:%s\n' "$remote" "$b" "$b" >&2
-		done
-		exit 1
-	}
-done
-note "${#pr_branches[@]} PR branch(es) chained on top of $base, in order"
-
-# ---------------------------------------------------------------------------
-# Remote existence, and the remote being at the local tip.
+# Remote existence. The tips are taken before the order check so that when the
+# order is off, the message can say exactly which local branches differ from
+# the remote's instead of guessing.
 
 step "Checking branches on $remote"
 
@@ -261,19 +239,64 @@ while read -r sha ref; do
 done <<<"$remote_refs"
 
 missing=()
-stale=()
 for b in "${branches[@]}"; do
-	if [[ -z "${remote_sha[$b]:-}" ]]; then
-		missing+=("$b")
-	elif [[ "$b" != "$base" && "${remote_sha[$b]}" != "${local_sha[$b]}" ]]; then
-		# The base only has to exist: it is typically the trunk, and where
-		# the local trunk sits has no bearing on the PRs. Every PR branch,
-		# though, was checked for order above using its *local* tip, so that
-		# is the tip GitHub has to see too.
-		stale+=("$b")
-	fi
+	[[ -n "${remote_sha[$b]:-}" ]] || missing+=("$b")
 done
 [[ ${#missing[@]} -eq 0 ]] || die "not on $remote: ${missing[*]}"
+note "all ${#branches[@]} on $remote"
+
+# ---------------------------------------------------------------------------
+# Order: every entry must be a strict ancestor of the next one.
+
+step "Checking that $list_file follows the git history"
+
+for ((i = 1; i < ${#branches[@]}; i++)); do
+	prev="${branches[$((i - 1))]}"
+	cur="${branches[$i]}"
+	[[ "${local_sha[$prev]}" != "${local_sha[$cur]}" ]] ||
+		die "$prev and $cur point at the same commit ${local_sha[$cur]:0:12}"
+	git merge-base --is-ancestor "$prev" "$cur" || {
+		printf 'error: %s is not an ancestor of %s: the list is not in git-history order\n' "$prev" "$cur" >&2
+		# Either the list is wrong, or a local branch is behind the remote:
+		# a clone that last fetched the stack before a rebase still has the
+		# old tip, and a plain fetch refuses to move it there. The remote's
+		# tips are known by now, so say which branches those are — the base
+		# included, since a base left behind by a rebase breaks the order
+		# just like any PR branch — and print the forced fetch for exactly
+		# those. When nothing differs, no fetch would help.
+		behind=()
+		for b in "${branches[@]}"; do
+			[[ "${remote_sha[$b]}" == "${local_sha[$b]}" ]] || behind+=("$b")
+		done
+		if [[ ${#behind[@]} -eq 0 ]]; then
+			printf 'every branch in the list is at %s'"'"'s tip: the list is out of order, or the stack needs a rebase / remap\n' "$remote" >&2
+		else
+			printf 'these local branches differ from %s:\n' "$remote" >&2
+			for b in "${behind[@]}"; do
+				printf '   %s (local %s, remote %s)\n' "$b" "${local_sha[$b]:0:12}" "${remote_sha[$b]:0:12}" >&2
+			done
+			printf '\nTo take %s'"'"'s tips for them (fetch refuses to move a checked-out branch):\n' "$remote" >&2
+			for b in "${behind[@]}"; do
+				printf '   git fetch %s +%s:%s\n' "$remote" "$b" "$b" >&2
+			done
+		fi
+		exit 1
+	}
+done
+note "${#pr_branches[@]} PR branch(es) chained on top of $base, in order"
+
+# ---------------------------------------------------------------------------
+# The remote being at the local tip. The base only has to exist: it is
+# typically the trunk, and where the local trunk sits has no bearing on the
+# PRs. Every PR branch, though, was checked for order above using its *local*
+# tip, so that is the tip GitHub has to see too.
+
+step "Checking that $remote has the PR branches at their local tips"
+
+stale=()
+for b in "${pr_branches[@]}"; do
+	[[ "${remote_sha[$b]}" == "${local_sha[$b]}" ]] || stale+=("$b")
+done
 if [[ ${#stale[@]} -gt 0 ]]; then
 	printf 'error: remote tip differs from local tip for:\n' >&2
 	for b in "${stale[@]}"; do
@@ -286,7 +309,7 @@ if [[ ${#stale[@]} -gt 0 ]]; then
 	done
 	exit 1
 fi
-note "all ${#branches[@]} on $remote; PR branches at their local tips"
+note "PR branches at their local tips"
 
 # ---------------------------------------------------------------------------
 # The base's own PR: what the bottom PR goes in after, unless the base is the
