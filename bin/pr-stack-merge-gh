@@ -42,8 +42,8 @@
 #            and that the PR branch matches its remote tip;
 #         2. retarget the PR onto <base> if it still points at a merged branch;
 #         3. wait until it is approved, its review conversations are all
-#            resolved, CI is green, and — with --require-local-review — a
-#            local review run says it is ready;
+#            resolved, CI is green, no hold is in place, and — with
+#            --require-local-review — a local review run says it is ready;
 #         4. merge via GitHub, wait for the merge to land;
 #         5. pr-stack advance — pull <base>, comment the merged branch out
 #            of the map;
@@ -94,12 +94,13 @@
 #       earlier local-vs-remote check. A PR merged or closed by someone
 #       else while waiting is noticed and handled rather than fought.
 #
-#       A hold file — <reviews-dir>/<pr>-<branch-slug>/hold, see lib/review.sh
-#       — is a fourth gate, and unlike the third it is always on: a hold is
-#       the operator saying "not this one yet", so it holds whether or not
-#       --require-local-review is given and whatever the verdict says. It is
-#       waited on like the others, so `unhold` releases the train in place.
-#       `hold` and `unhold` write and remove the file for a PR in the plan.
+#       A hold is a gate of its own: the operator saying "not this one yet",
+#       for any reason at all. It has nothing to do with reviews — no review
+#       run creates or clears it, and it is always on, whatever the flags.
+#       Like the other gates it is waited on and reported alongside them, so
+#       `unhold` releases the train in place. `hold` and `unhold` write and
+#       remove the hold file for a PR in the plan; the file lives at
+#       <reviews-dir>/<pr>-<branch-slug>/hold (see lib/review.sh).
 #
 # Plan file format: "<branch-name>  #<pr-number>  <pr-title>", one per line.
 # Unlike map files, only whole-line "#" comments are recognised (a PR number
@@ -234,12 +235,13 @@ Commands:
                        false or malformed verdict blocks the merge. Like
                        the other gates this is waited on, not aborted at,
                        so reviewing in another terminal releases the train.
-                       A hold file (<pr>-<branch-slug>/hold, see the hold
-                       command) blocks the merge regardless of this flag
-                       and of the verdict, and is waited on the same way.
         --local-reviews-dir <path>
-                       where those reviews live (default:
-                       <repo-root>/.reviews). Implies --require-local-review.
+                       where the local reviews and the hold files live
+                       (default: <repo-root>/.reviews). Implies
+                       --require-local-review.
+
+        A held PR (see the hold command) is never merged: the hold is
+        waited on like the other gates, and no flag skips it.
         --skip-approval
                        merge without an approving review.
         --allow-unresolved
@@ -289,21 +291,20 @@ Commands:
                        resolves on its own.
 
   status [--local-reviews-dir <path>] <plan-file>
-        Show the plan's progress: merged entries, what is up next, and three
-        review columns per remaining PR — its GitHub review state, its
-        unresolved review conversations, and the verdict of its newest local
-        review run (or "held" when a hold file is in place): the gates
-        merge-next waits on. Costs two API calls per PR; a failed query
+        Show the plan's progress: merged entries, what is up next, and four
+        gate columns per remaining PR — its GitHub review state, the verdict
+        of its newest local review run, its unresolved review conversations,
+        and whether it is held: the gates merge-next waits on. Costs two API
+        calls per PR; a failed query
         shows "?" rather than aborting, since it says nothing about the PR
         either way.
 
   hold [--local-reviews-dir <path>] <plan-file> <pr-number> [<reason>...]
         Hold a PR in the plan back from merging: writes
         <reviews-dir>/<pr>-<branch-slug>/hold with the reason as its
-        first line. merge-next waits on the file whatever the review
-        verdict says and whether or not --require-local-review is given;
-        status shows the PR as "held". Re-running replaces the reason.
-        Nothing on GitHub is touched.
+        first line. merge-next waits on the file whatever the flags;
+        status shows it in the hold column. Re-running replaces the
+        reason. Nothing on GitHub is touched.
 
   unhold [--local-reviews-dir <path>] <plan-file> <pr-number>
         Remove that hold. A merge-next already waiting on it carries on
@@ -313,7 +314,7 @@ Commands:
         List the plan's held PRs with their reasons.
 
         --local-reviews-dir <path>
-                       where the local reviews live (default:
+                       where the hold files live (default:
                        <repo-root>/.reviews), as for merge-next.
 
   checks [--required-only] [--ignore-checks-file <path>]
@@ -511,19 +512,20 @@ cmd_status() {
 		printf '\nThe train is complete.\n'
 		return 0
 	fi
-	# The three review columns are the independent gates merge-next weighs
+	# The four gate columns are the independent gates merge-next weighs
 	# separately, so they are shown separately too: a PR can be approved on
 	# GitHub with no local review run against it, or reviewed locally and never
-	# approved, or both with a review conversation still open. A header keeps
-	# three same-shaped columns of adjectives apart.
+	# approved, or both with a review conversation still open — and any of
+	# those held or not. A header keeps four same-shaped columns of adjectives
+	# apart.
 	local width=0 i
 	for i in "${!PLAN_BRANCHES[@]}"; do
 		[[ ${#PLAN_BRANCHES[$i]} -gt $width ]] && width=${#PLAN_BRANCHES[$i]}
 	done
 	printf '\nUp next:\n'
-	printf '     %-11s %-10s %-8s %-6s %-*s %s\n' \
-		'github' 'local' 'threads' 'pr' "$width" 'branch' 'title'
-	local marker label local_label thread_label approved=0 reviewed=0 resolved=0 held=0
+	printf '     %-11s %-10s %-8s %-5s %-6s %-*s %s\n' \
+		'github' 'local' 'threads' 'hold' 'pr' "$width" 'branch' 'title'
+	local marker label local_label thread_label hold_label approved=0 reviewed=0 resolved=0 held=0
 	local status pr_state pr_draft pr_decision unresolved
 	for i in "${!PLAN_BRANCHES[@]}"; do
 		if [[ $i -eq 0 ]]; then marker="->"; else marker="  "; fi
@@ -541,12 +543,13 @@ cmd_status() {
 			thread_label="?"
 		fi
 		local_label="$(local_review_label "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
+		hold_label="$(hold_label "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
 		[[ "$label" == "approved" ]] && approved=$((approved + 1))
 		[[ "$local_label" == "ready" ]] && reviewed=$((reviewed + 1))
-		[[ "$local_label" == "held" ]] && held=$((held + 1))
+		[[ "$hold_label" == "held" ]] && held=$((held + 1))
 		[[ "$thread_label" == "resolved" ]] && resolved=$((resolved + 1))
-		printf '  %s %-11s %-10s %-8s #%-5s %-*s %s\n' \
-			"$marker" "$label" "$local_label" "$thread_label" "${PLAN_NUMBERS[$i]}" \
+		printf '  %s %-11s %-10s %-8s %-5s #%-5s %-*s %s\n' \
+			"$marker" "$label" "$local_label" "$thread_label" "$hold_label" "${PLAN_NUMBERS[$i]}" \
 			"$width" "${PLAN_BRANCHES[$i]}" "${PLAN_TITLES[$i]}"
 	done
 	printf '\n%d of %d approved, %d locally reviewed, %d fully resolved, %d held.\n' \
@@ -872,12 +875,7 @@ unresolved_label() {
 # without restarting it.
 local_review_blocker() {
 	local number="$1" branch="$2" dir="$3"
-	local verdict_file value held
-	held="$(hold_blocker "$number" "$branch" "$dir")"
-	if [[ -n "$held" ]]; then
-		printf '%s' "$held"
-		return 0
-	fi
+	local verdict_file value
 	verdict_file="$(review_verdict_file "$dir" "$number" "$branch")"
 
 	if [[ ! -f "$verdict_file" ]]; then
@@ -899,8 +897,7 @@ local_review_blocker() {
 # hold_blocker <pr-number> <branch> <reviews-dir>
 #
 # Prints why the hold file does not clear this PR for merging — its reason and
-# where the file is — or nothing when there is no hold. Checked before the
-# verdict: a hold outranks a "true", which is the whole point of it.
+# where the file is — or nothing when there is no hold.
 hold_blocker() {
 	local number="$1" branch="$2" dir="$3"
 	local hold_file reason
@@ -918,10 +915,6 @@ hold_blocker() {
 local_review_label() {
 	local number="$1" branch="$2" dir="$3"
 	local verdict
-	if [[ -n "$(read_hold "$(review_hold_file "$dir" "$number" "$branch")")" ]]; then
-		printf 'held'
-		return 0
-	fi
 	verdict="$(read_verdict "$(review_verdict_file "$dir" "$number" "$branch")")"
 	case "$verdict" in
 	true) printf 'ready' ;;
@@ -929,6 +922,19 @@ local_review_label() {
 	"") printf 'none' ;;
 	*) printf '%s' "$verdict" ;;
 	esac
+}
+
+# hold_label <pr-number> <branch> <reviews-dir>
+#
+# The column form of hold_blocker: "held" or "-". The reason stays out of the
+# table — it is a sentence; `holds` lists it.
+hold_label() {
+	local number="$1" branch="$2" dir="$3"
+	if [[ -n "$(read_hold "$(review_hold_file "$dir" "$number" "$branch")")" ]]; then
+		printf 'held'
+	else
+		printf -- '-'
+	fi
 }
 
 # poll_checks <pr-number> [--required]
@@ -1148,8 +1154,8 @@ cmd_merge_next() {
 		esac
 	done
 	[[ ${#positional[@]} -eq 2 ]] || usage 1
-	# The hold gate reads the same tree whether or not the verdict gate is on,
-	# so the directory is resolved unconditionally.
+	# The hold files live in this directory too, and the hold gate is always
+	# on, so the directory is resolved whether or not the verdict gate is.
 	[[ -n "$local_reviews_dir" ]] || local_reviews_dir="$(git rev-parse --show-toplevel)/.reviews"
 	local plan_file="${positional[0]}" map_file="${positional[1]}"
 	[[ -f "$plan_file" ]] || die "plan file not found: $plan_file"
@@ -1295,20 +1301,19 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 					;;
 				esac
 
-				# Two independent gates, evaluated separately and reported
+				# Independent gates, evaluated separately and reported
 				# together. The local review is not a GitHub review and neither
 				# stands in for the other: a PR can be approved on GitHub with
 				# no local review run against it, or reviewed locally and never
-				# approved. Letting one short-circuit the other would hide
-				# whichever came second and turn a two-item fix list into two
-				# round trips.
-				local blockers=() local_blocker="" approval="" conversations=""
+				# approved. The hold is neither — it is the operator's word, on
+				# whatever the reviews say, and no flag switches it off.
+				# Letting one gate short-circuit another would hide whichever
+				# came second and turn a two-item fix list into two round trips.
+				local blockers=() local_blocker="" hold="" approval="" conversations=""
+				hold="$(hold_blocker "$number" "$branch" "$local_reviews_dir")"
+				[[ -z "$hold" ]] || blockers+=("$hold")
 				if [[ "$require_local_review" -eq 1 ]]; then
 					local_blocker="$(local_review_blocker "$number" "$branch" "$local_reviews_dir")"
-				else
-					# No verdict gate, but a hold is the operator's word and
-					# holds regardless.
-					local_blocker="$(hold_blocker "$number" "$branch" "$local_reviews_dir")"
 				fi
 				[[ -z "$local_blocker" ]] || blockers+=("local review: $local_blocker")
 				if [[ "$allow_unresolved" -eq 0 ]]; then

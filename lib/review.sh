@@ -13,16 +13,14 @@
 #       002/ …
 #       latest -> 002     symlink onto the newest run
 #       hold              optional: while present, the PR is held back from
-#                         merging whatever the verdict says; its first line
-#                         is the reason
+#                         merging; its first line is the reason
 #
 # The verdict of record is <latest>/verdict, holding "true" or "false".
 #
-# The hold is the operator's file, not the reviewer's: a review run neither
-# creates nor removes it. It exists because a verdict of "true" means "no
-# blocking finding", which is not the same as "nothing left to decide" — a
-# question the reviewer carried as non-blocking, a ruling still owed, a fix
-# queued but not landed, all leave the verdict true and the PR not ready.
+# The hold is not part of the review: it only shares the PR's directory. It is
+# the operator's "not this one yet", for any reason at all, and a gate of its
+# own — independent of every verdict. A review run neither creates nor removes
+# it.
 
 # review_slug <pr-number> <branch>
 #
