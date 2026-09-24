@@ -174,7 +174,7 @@ Commands:
         `review` because it cannot answer what `review` answers: there is
         no PR number, and the base is asserted rather than derived. Its run
         directories and session names are shaped accordingly, and the merge
-        script's --require-local-review gate does not look for them.
+        script's local review gate does not look for them.
 
   review-all [options] [--failed] [--max <n>] [--keep-going] <plan-file>
         Review every not-yet-reviewed active entry in the plan, bottom

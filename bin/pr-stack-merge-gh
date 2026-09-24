@@ -42,8 +42,8 @@
 #            and that the PR branch matches its remote tip;
 #         2. retarget the PR onto <base> if it still points at a merged branch;
 #         3. wait until it is approved, its review conversations are all
-#            resolved, CI is green, no hold is in place, and — with
-#            --require-local-review — a local review run says it is ready;
+#            resolved, CI is green, no hold is in place, and — unless
+#            --no-require-local-review — a local review run says it is ready;
 #         4. merge via GitHub, wait for the merge to land;
 #         5. pr-stack advance — pull <base>, comment the merged branch out
 #            of the map;
@@ -80,8 +80,9 @@
 #       script needs it: thread resolution is absent from the REST-backed
 #       `gh pr view --json` field set.
 #
-#       --require-local-review adds a third gate, independent of the other
-#       two: the newest local review run for this PR (as written by
+#       The local review is a third gate, independent of the other two and
+#       on by default (--no-require-local-review switches it off): the
+#       newest local review run for this PR (as written by
 #       pr-stack-review-claude) must have concluded "true". It is not a
 #       GitHub review and neither substitutes for the other — a PR can be
 #       approved on GitHub having never been reviewed locally, or reviewed
@@ -211,7 +212,8 @@ Commands:
 
   merge-next [--base <branch>] [--stack <branch>] [--remote <name>]
              [--merge-method merge|squash|rebase] [--skip-ci | --no-wait-ci]
-             [--skip-approval] [--require-local-review] [--local-reviews-dir <path>]
+             [--skip-approval] [--require-local-review | --no-require-local-review]
+             [--local-reviews-dir <path>]
              [--ci-interval <seconds>]
              [--ci-retry-interval <seconds>] [--ci-timeout <seconds>]
              [--no-checks-timeout <seconds>] [--rerun-cooldown <seconds>]
@@ -221,27 +223,29 @@ Commands:
         rebase the stack, remap the branches and push. Re-run to resume
         after a failure; re-run again for the next PR in the train.
 
-        A PR is merged only once it is approved and its checks are green.
-        Both are waited out by default, so a run can be left unattended
-        while a reviewer approves and someone fixes the build; the stack is
-        re-verified before merging, since a fix usually arrives as a push
-        to the PR branch.
+        A PR is merged only once it is approved, its checks are green and
+        its local review says it is ready. All are waited out by default,
+        so a run can be left unattended while a reviewer approves and
+        someone fixes the build; the stack is re-verified before merging,
+        since a fix usually arrives as a push to the PR branch.
 
-        --require-local-review
-                       also require a local review verdict of "true" for
-                       this PR, from the newest run under the reviews
-                       directory (as written by pr-stack-review-claude:
+        A held PR (see the hold command) is never merged: the hold is
+        waited on like the other gates, and no flag skips it.
+
+        --require-local-review (the default)
+                       require a local review verdict of "true" for this
+                       PR, from the newest run under the reviews directory
+                       (as written by pr-stack-review-claude:
                        <pr>-<branch-slug>/latest/verdict). A missing,
                        false or malformed verdict blocks the merge. Like
                        the other gates this is waited on, not aborted at,
                        so reviewing in another terminal releases the train.
+        --no-require-local-review
+                       merge without a local review verdict. The last of
+                       the two flags given wins.
         --local-reviews-dir <path>
                        where the local reviews and the hold files live
-                       (default: <repo-root>/.reviews). Implies
-                       --require-local-review.
-
-        A held PR (see the hold command) is never merged: the hold is
-        waited on like the other gates, and no flag skips it.
+                       (default: <repo-root>/.reviews).
         --skip-approval
                        merge without an approving review.
         --allow-unresolved
@@ -1122,7 +1126,7 @@ cmd_merge_next() {
 	local wait_ci=1 ci_retry_interval=120 ci_timeout=0 no_checks_timeout=900
 	local rerun_cooldown=120
 	local required_only=""
-	local require_local_review=0 local_reviews_dir="" allow_unresolved=0
+	local require_local_review=1 local_reviews_dir="" allow_unresolved=0
 	local positional=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
@@ -1142,7 +1146,8 @@ cmd_merge_next() {
 		--ignore-check) [[ -n "${2:-}" ]] || die "--ignore-check requires a value"; IGNORE_CHECKS+=("$2"); shift 2 ;;
 		--ignore-checks-file) [[ -n "${2:-}" ]] || die "--ignore-checks-file requires a value"; load_ignore_checks_file "$2"; shift 2 ;;
 		--require-local-review) require_local_review=1; shift ;;
-		--local-reviews-dir) local_reviews_dir="${2:-}"; [[ -n "$local_reviews_dir" ]] || die "--local-reviews-dir requires a value"; require_local_review=1; shift 2 ;;
+		--no-require-local-review) require_local_review=0; shift ;;
+		--local-reviews-dir) local_reviews_dir="${2:-}"; [[ -n "$local_reviews_dir" ]] || die "--local-reviews-dir requires a value"; shift 2 ;;
 		--allow-unresolved) allow_unresolved=1; shift ;;
 		--skip-ci) skip_ci=1; shift ;;
 		--skip-approval) skip_approval=1; shift ;;
@@ -1270,7 +1275,7 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 			held="$(hold_blocker "$number" "$branch" "$local_reviews_dir")"
 			[[ -z "$held" ]] || die_resumable "PR #$number is not ready to merge: $held" \
 				"Run: $0 unhold $plan_file $number — then re-run."
-			step "Skipping the approval, conversation and CI waits (--skip-approval --allow-unresolved --skip-ci)"
+			step "Skipping the approval, conversation, local review and CI waits (--skip-approval --allow-unresolved --no-require-local-review --skip-ci)"
 		else
 			step "Waiting for PR #$number to become mergeable"
 			local checks ci_state summary waited_ci=0 no_checks_waited=0
@@ -1367,7 +1372,7 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 						die_resumable "PR #$number is not ready to merge: $blocker" \
 							"Clear the blocker(s) above, then re-run — or drop --no-wait-ci to keep waiting.
 Use --skip-approval to merge without a GitHub approval; --allow-unresolved to
-merge with review conversations still open; drop --require-local-review to
+merge with review conversations still open; --no-require-local-review to
 merge without a local review verdict."
 					if [[ "$ci_timeout" -gt 0 && "$waited_ci" -ge "$ci_timeout" ]]; then
 						die_resumable "PR #$number is still not ready after ${waited_ci}s ($blocker)" \
