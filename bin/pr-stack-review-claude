@@ -180,6 +180,8 @@ Commands:
         Review every not-yet-reviewed active entry in the plan, bottom
         first. Stops at the first failure so nothing is silently skipped;
         --keep-going records the failure and carries on. Re-run to resume.
+        Ctrl-C stops the train, --keep-going or not, once the running
+        review has shut down; that review is left resumable (see --resume).
         A branch whose verdict file is missing or unreadable counts as
         not reviewed, so a run that went wrong is retried rather than
         quietly accepted.
@@ -474,6 +476,55 @@ claim_worktree() {
 	ORIG_BRANCH="$(git symbolic-ref --short -q HEAD)" ||
 		die "detached HEAD — check out a branch first, so there is something to come back to"
 	trap restore_branch EXIT
+	trap_interrupts
+}
+
+# ---------------------------------------------------------------------------
+# Interruption
+# ---------------------------------------------------------------------------
+
+# Name of the signal that interrupted the run; empty while nothing has.
+INTERRUPTED=""
+# 1 while a review's claude pipeline is running, 0 otherwise. Bash holds a
+# trap until the foreground command has completed, so the handler never runs
+# mid-pipeline; the flag tells it, once it does run, whether the signal landed
+# during a review — whose outcome run_review must now judge — or between two,
+# where there is nothing to judge and stopping is the whole job.
+CLAUDE_RUNNING=0
+
+# on_interrupt <signal-name>
+#
+# Ctrl-C reaches every process in the terminal's foreground group at once:
+# this script, claude, tee and the formatter. claude catches SIGINT, shuts
+# down and exits normally — and bash, seeing a child exit normally after a
+# SIGINT, takes the signal as handled and carries on with the script. Left
+# untrapped, an interrupt is therefore indistinguishable from a review that
+# failed, and under --keep-going the train simply starts the next branch. The
+# trap records the signal as a fact instead, for run_review and the train loop
+# to act on as soon as the child has finished.
+on_interrupt() {
+	INTERRUPTED="$1"
+	[[ "$CLAUDE_RUNNING" -eq 0 ]] || return 0
+	# Between reviews there is no claude to wait for and nothing to judge.
+	# The EXIT trap still restores the branch on the way out.
+	printf '\n%sInterrupted (%s).%s\n' "$BOLD" "$INTERRUPTED" "$RESET" >&2
+	exit "$(interrupt_status)"
+}
+
+# interrupt_status
+#
+# 128 + the recorded signal's number: the status a caller would have seen had
+# the script died of the signal untrapped.
+interrupt_status() {
+	printf '%d' "$((128 + $(kill -l "$INTERRUPTED")))"
+}
+
+trap_interrupts() {
+	local sig
+	for sig in INT TERM HUP; do
+		# shellcheck disable=SC2064  # the name is meant to expand now
+		trap "on_interrupt $sig" "$sig"
+	done
 }
 
 # assert_worktree_undisturbed <branch>
@@ -728,7 +779,13 @@ run_review() {
 	[[ -n "$EFFORT" ]] && claude_cmd+=(--effort "$EFFORT")
 	[[ "$TOOL_LIMITS" -eq 1 ]] && claude_cmd+=(--allowed-tools "${ALLOWED_TOOLS[@]}")
 	if [[ "$TIMEOUT" -gt 0 ]]; then
-		claude_cmd=(timeout --signal=INT "$TIMEOUT" "${claude_cmd[@]}")
+		# --foreground keeps timeout in the terminal's process group. Without
+		# it timeout moves into a group of its own, and neither it nor claude
+		# ever hears the terminal's Ctrl-C: the script would sit through the
+		# whole timeout, unable to stop. The cost is that on expiry only claude
+		# itself is signalled, not the tools it has running; claude takes those
+		# down as part of its own shutdown.
+		claude_cmd=(timeout --foreground --signal=INT "$TIMEOUT" "${claude_cmd[@]}")
 	fi
 
 	tick "running claude"
@@ -737,7 +794,29 @@ run_review() {
 	# follows them, and the file remains one transcript of how this run went.
 	local -a capture=(tee "$REVIEW_OUTPUT")
 	[[ "$resuming" -eq 1 ]] && capture=(tee -a "$REVIEW_OUTPUT")
+	CLAUDE_RUNNING=1
 	printf '%s' "$prompt" | "${claude_cmd[@]}" | "${capture[@]}" | format_stream || rc=$?
+	# An interrupt that cut the review short is not a failure: the run keeps
+	# its session id and no verdict, which is exactly what --resume looks for.
+	# One that arrived as claude was writing its last file changed nothing —
+	# the run decided, and is judged below like any other. The signal does end
+	# tee and the formatter on the spot, so the pipeline's status says nothing
+	# about claude's own, and the transcript of a cut-off run may stop a few
+	# events short; the session itself is claude's, and is unaffected. Stages
+	# that outlived the signal would instead wait for whatever still held
+	# claude's stdout, and a stop that can hang is worse than a short
+	# transcript.
+	if [[ -n "$INTERRUPTED" ]]; then
+		if ! review_is_done "$REVIEW_VERDICT"; then
+			printf '\n%sInterrupted (%s) during #%s %s.%s\n' "$BOLD" "$INTERRUPTED" "$pr" "$branch" "$RESET" >&2
+			note "run kept in $REVIEW_DIR/; --resume continues its session, --force starts a fresh run"
+			return "$(interrupt_status)"
+		fi
+		# The verdict is the completion marker; it, not a dead tee, says how
+		# this run went. The files are still checked below like any other's.
+		rc=0
+	fi
+	CLAUDE_RUNNING=0
 	if [[ "$rc" -ne 0 ]]; then
 		printf 'error: claude exited %s for %s (transcript in %s)\n' "$rc" "$branch" "$REVIEW_OUTPUT" >&2
 		return 1
@@ -1067,7 +1146,7 @@ cmd_review_all() {
 	[[ "$failed" -eq 1 ]] && doing="re-review"
 	printf '%s%d branch(es) to %s from %s.%s\n' "$BOLD" "${#todo_idx[@]}" "$doing" "$plan_file" "$RESET"
 
-	local done_count=0 failed_count=0 idx branch base pr title verdict
+	local done_count=0 failed_count=0 idx branch base pr title verdict review_rc
 	local -a summary=()
 	for idx in "${todo_idx[@]}"; do
 		if [[ "$max" -gt 0 && "$done_count" -ge "$max" ]]; then
@@ -1085,9 +1164,14 @@ cmd_review_all() {
 		step "Reviewing #$pr $branch ($((done_count + 1))/${#todo_idx[@]})"
 		[[ -n "$title" ]] && note "$title"
 
-		if run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE"; then
+		review_rc=0
+		run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE" || review_rc=$?
+		if [[ "$review_rc" -eq 0 ]]; then
 			verdict="$(read_verdict "$REVIEW_VERDICT")"
 			summary+=("$(printf '%-6s #%-5s %s' "${verdict:-dry-run}" "$pr" "$branch")")
+		elif [[ -n "$INTERRUPTED" ]]; then
+			# Cut short, not failed: the run is there to be resumed.
+			summary+=("$(printf '%-6s #%-5s %s' "paused" "$pr" "$branch")")
 		else
 			failed_count=$((failed_count + 1))
 			summary+=("$(printf '%-6s #%-5s %s' "FAILED" "$pr" "$branch")")
@@ -1097,6 +1181,15 @@ cmd_review_all() {
 				print_summary "${summary[@]}"
 				return 1
 			fi
+		fi
+		# An interrupt ends the train whatever --keep-going says: that flag is
+		# about failures, and being asked to stop is not one. The review that
+		# was running has either been recorded above or is waiting for --resume.
+		if [[ -n "$INTERRUPTED" ]]; then
+			printf '\n%sInterrupted at #%s %s.%s Re-run to continue the train.\n' \
+				"$BOLD" "$pr" "$branch" "$RESET" >&2
+			print_summary "${summary[@]}"
+			return "$(interrupt_status)"
 		fi
 		done_count=$((done_count + 1))
 	done
