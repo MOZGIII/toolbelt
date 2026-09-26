@@ -90,6 +90,9 @@
 #       rejections, to be re-reviewed once the code is fixed. Only a decided
 #       "false" qualifies: errored, malformed and unfinished runs are pending,
 #       not rejected, and the ordinary selection is what retries those.
+#       With --progress-track <name> the train is a named walk that survives
+#       being stopped: what it has passed is recorded, and a re-run under the
+#       same name carries on from the entry it was on (see "Walks" below).
 #
 #   status [options] <plan-file>
 #       Show which plan entries have been reviewed and what they came back
@@ -98,6 +101,42 @@
 # Plan file format is pr-stack-merge-gh's: "<branch>  #<pr-number>
 # <pr-title>", one per line, whole-line "#" comments. Entries commented out as
 # merged are still read, because they are still part of the base chain.
+#
+# Walks (review-all --progress-track <name>):
+#
+# Verdicts alone cannot resume every train. A --force train re-reviews decided
+# entries, so a re-run cannot tell the ones this train already redid from the
+# ones it has not reached; a --failed train re-reviews rejections, and one that
+# came back "false" again looks exactly like one not yet retried. A walk
+# records what the train itself has passed, under a name, so a re-run with the
+# same name continues from where the previous run stopped whatever the passed
+# entries decided:
+#
+#   .reviews/walks/<name>
+#       # header comments: the plan the walk runs over, when it started
+#       <state>  #<pr-number>  <branch>      one line per entry reached
+#
+# The state is "running" while the entry's review is in flight and becomes its
+# verdict ("true" / "false") when the review decides, or "failed" when the
+# review errored and --keep-going moved the train past it. The file is
+# rewritten whole at each of those transitions.
+#
+# On a re-run the flags still say which entries the train visits (the ordinary
+# selection, --failed, or --force); the walk then overrides per entry: a
+# concluded state is skipped regardless of what it concluded, and "running" is
+# taken whatever the flags say — an unfinished run has no verdict, so --failed
+# alone would drop the very entry the walk was on — and picks its Claude Code
+# session up the way --resume does, --force notwithstanding. A "running" entry
+# whose newest run already holds a verdict (the stop landed as the verdict was
+# being written) is recorded with that verdict and skipped, never reviewed
+# twice. A review that errors without --keep-going stops the train and stays
+# "running", so the re-run retries exactly there.
+#
+# A finished walk keeps its file as the record; a re-run under its name finds
+# nothing left. A new walk is a new name, or the old file deleted. --dry-run
+# reads a walk but never writes one. The merge gate never reads walks: they
+# are the reviewer's own bookkeeping, and "hold" files remain the only gate
+# beside the verdicts.
 #
 set -euo pipefail
 
@@ -176,7 +215,8 @@ Commands:
         directories and session names are shaped accordingly, and the merge
         script's local review gate does not look for them.
 
-  review-all [options] [--failed] [--max <n>] [--keep-going] <plan-file>
+  review-all [options] [--failed] [--max <n>] [--keep-going]
+             [--progress-track <name>] <plan-file>
         Review every not-yet-reviewed active entry in the plan, bottom
         first. Stops at the first failure so nothing is silently skipped;
         --keep-going records the failure and carries on. Re-run to resume.
@@ -192,6 +232,15 @@ Commands:
         re-review is a fresh numbered run beside the one it answers.
         Refuses --force, which redoes decided entries regardless of their
         verdict: to redo passed reviews too, drop --failed.
+        --progress-track <name> makes the train a walk that survives being
+        stopped: every entry it passes is recorded in
+        <output-dir>/walks/<name> with what it concluded, and a re-run
+        under the same name skips those whatever they concluded, resumes
+        the review that was in flight (its Claude Code session, as with
+        --resume — --force does not override this), and goes on with the
+        rest of the selection. --force and --failed keep their meaning for
+        the entries the walk has not reached. A finished walk stays on
+        disk; start another under a new name, or delete the file.
 
   status [--output-dir <dir>] <plan-file>
         Print each plan entry with its review state and verdict.
@@ -438,6 +487,129 @@ review_is_done() {
 	local verdict
 	verdict="$(read_verdict "$1")"
 	[[ "$verdict" == "true" || "$verdict" == "false" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Walks (review-all --progress-track)
+#
+# The train's own record of what it has passed, kept beside the per-branch
+# directories as <output-dir>/walks/<name>. The header comment of this file
+# says what a walk is for and how a re-run reads it; this section is the file
+# itself: one header, one line per entry reached, rewritten whole at every
+# state change.
+# ---------------------------------------------------------------------------
+
+WALK_NAME=""
+WALK_FILE=""
+# The file's comment lines, kept verbatim across rewrites so the walk remembers
+# which plan it runs over and when it started.
+WALK_HEADER=""
+# Parallel arrays, in the order the train reached the entries.
+WALK_STATES=()
+WALK_NUMBERS=()
+WALK_BRANCHES=()
+
+# load_walk <output-dir> <plan-file>
+#
+# Points WALK_FILE at the named walk and reads it when it is there. A walk that
+# was started over another plan is refused: the name identifies one train over
+# one plan, and continuing it over a different plan would skip entries on the
+# strength of a record that was never about them. "Another plan" means another
+# file: the plan is recorded and compared by its resolved path, since the same
+# map is reached through a notes symlink from one worktree and directly from
+# the next, and both are one plan.
+load_walk() {
+	local dir="$1" plan_file="$2" plan
+	plan="$(resolve_self "$plan_file")"
+	WALK_FILE="$dir/walks/$WALK_NAME"
+	WALK_STATES=()
+	WALK_NUMBERS=()
+	WALK_BRANCHES=()
+	if [[ ! -f "$WALK_FILE" ]]; then
+		WALK_HEADER="$(printf '# review-all walk "%s"\n# plan: %s\n# started: %s\n# <state>  #<pr-number>  <branch> — running, true, false or failed' \
+			"$WALK_NAME" "$plan" "$(date -u '+%Y-%m-%d %H:%M:%SZ')")"
+		return 0
+	fi
+	WALK_HEADER=""
+	local line body state number branch lineno=0 nl=$'\n' recorded_plan=""
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		lineno=$((lineno + 1))
+		body="${line#"${line%%[![:space:]]*}"}" # ltrim
+		[[ -n "$body" ]] || continue
+		if [[ "$body" == \#* ]]; then
+			WALK_HEADER+="${WALK_HEADER:+$nl}$line"
+			[[ "$body" != "# plan: "* ]] || recorded_plan="${body#\# plan: }"
+			continue
+		fi
+		read -r state number branch <<<"$body"
+		case "$state" in
+		running | true | false | failed) ;;
+		*) die "$WALK_FILE:$lineno: unknown walk state \"$state\" (expected running, true, false or failed)" ;;
+		esac
+		[[ "$number" =~ ^#[0-9]+$ && -n "$branch" ]] ||
+			die "$WALK_FILE:$lineno: expected \"<state>  #<pr-number>  <branch>\""
+		WALK_STATES+=("$state")
+		WALK_NUMBERS+=("${number#\#}")
+		WALK_BRANCHES+=("$branch")
+	done <"$WALK_FILE"
+	[[ -z "$recorded_plan" || "$recorded_plan" == "$plan" ]] ||
+		die "walk \"$WALK_NAME\" was started over $recorded_plan, not $plan: pass that plan, or pick another name"
+}
+
+# walk_state_of <pr-number> <branch>
+#
+# The entry's recorded state, or nothing when the walk has not reached it.
+walk_state_of() {
+	local number="$1" branch="$2" i
+	for i in "${!WALK_NUMBERS[@]}"; do
+		if [[ "${WALK_NUMBERS[$i]}" == "$number" && "${WALK_BRANCHES[$i]}" == "$branch" ]]; then
+			printf '%s' "${WALK_STATES[$i]}"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# walk_passed_count
+#
+# How many entries the walk has concluded — everything recorded but the one
+# it may still be on.
+walk_passed_count() {
+	local state n=0
+	for state in "${WALK_STATES[@]}"; do
+		[[ "$state" == "running" ]] || n=$((n + 1))
+	done
+	printf '%s' "$n"
+}
+
+# walk_record <state> <pr-number> <branch>
+#
+# Sets the entry's state — appending the entry when the walk reaches it for
+# the first time — and writes the file whole. The write goes through a rename,
+# so a stop that lands mid-write leaves the previous record rather than a
+# truncated one.
+walk_record() {
+	local state="$1" number="$2" branch="$3" i found=0
+	for i in "${!WALK_NUMBERS[@]}"; do
+		if [[ "${WALK_NUMBERS[$i]}" == "$number" && "${WALK_BRANCHES[$i]}" == "$branch" ]]; then
+			WALK_STATES[i]="$state"
+			found=1
+			break
+		fi
+	done
+	if [[ "$found" -eq 0 ]]; then
+		WALK_STATES+=("$state")
+		WALK_NUMBERS+=("$number")
+		WALK_BRANCHES+=("$branch")
+	fi
+	mkdir -p "$(dirname "$WALK_FILE")"
+	{
+		printf '%s\n' "$WALK_HEADER"
+		for i in "${!WALK_STATES[@]}"; do
+			printf '%-8s #%-5s %s\n' "${WALK_STATES[$i]}" "${WALK_NUMBERS[$i]}" "${WALK_BRANCHES[$i]}"
+		done
+	} >"$WALK_FILE.tmp"
+	mv -f "$WALK_FILE.tmp" "$WALK_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -691,13 +863,15 @@ format_stream() {
 	return 0
 }
 
-# run_review <branch> <base> <pr> <title> <repo-root> <prompt-file>
+# run_review <branch> <base> <pr> <title> <repo-root> <prompt-file> <resume>
 #
 # Checks the branch out, runs Claude, and validates that the two files the
 # prompt asked for actually appeared. Returns nonzero on any of those failing;
-# the caller decides whether that stops a train.
+# the caller decides whether that stops a train. <resume> (1 or 0) is whether
+# to continue the branch's interrupted run when there is one: the flags decide
+# that for a single review, and a walk decides it for the entry it was on.
 run_review() {
-	local branch="$1" base="$2" pr="$3" title="$4" root="$5" prompt_file="$6"
+	local branch="$1" base="$2" pr="$3" title="$4" root="$5" prompt_file="$6" resume="$7"
 
 	git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null ||
 		die "branch not found locally: $branch"
@@ -712,7 +886,7 @@ run_review() {
 	# Resuming reuses the interrupted run's directory and session; anything else
 	# starts a numbered run of its own.
 	local resuming=0
-	if [[ "$RESUME" -eq 1 && "$FORCE" -eq 0 ]] && find_resumable_run; then
+	if [[ "$resume" -eq 1 ]] && find_resumable_run; then
 		resuming=1
 	else
 		plan_run_dir 0
@@ -968,7 +1142,10 @@ start_review() {
 	else
 		step "Reviewing #$pr $branch"
 	fi
-	run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE"
+	# --resume asks to continue an interrupted run; --force wins if both are given.
+	local resume=0
+	[[ "$RESUME" -eq 1 && "$FORCE" -eq 0 ]] && resume=1
+	run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE" "$resume"
 }
 
 cmd_review() {
@@ -1085,6 +1262,15 @@ cmd_review_all() {
 			keep_going=1
 			shift
 			;;
+		--progress-track)
+			WALK_NAME="${2:-}"
+			[[ -n "$WALK_NAME" ]] || die "--progress-track requires a name"
+			# The name is a file name under walks/: one path component, no
+			# shell-hostile characters.
+			[[ "$WALK_NAME" =~ ^[A-Za-z0-9._-]+$ ]] ||
+				die "--progress-track: a name is letters, digits, '.', '_' and '-' only: $WALK_NAME"
+			shift 2
+			;;
 		--*)
 			parse_common_opt "$@"
 			[[ "$OPT_CONSUMED" -gt 0 ]] || die "unknown option: $1"
@@ -1113,12 +1299,32 @@ cmd_review_all() {
 	local root
 	root="$(git rev-parse --show-toplevel)"
 	resolve_output_dir "$root"
+	[[ -z "$WALK_NAME" ]] || load_walk "$OUTPUT_DIR" "$plan_file"
 
 	local -a todo_idx=()
-	local i
+	local i walk_state
 	for i in "${!PLAN_BRANCHES[@]}"; do
 		[[ "${PLAN_ACTIVE[$i]}" -eq 1 ]] || continue
 		set_review_paths "$OUTPUT_DIR" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}"
+		# The walk speaks first: what it has passed is passed whatever it
+		# decided, and the entry it was on is taken whatever the flags would
+		# select — its run has no verdict yet, so --failed alone would drop it.
+		walk_state=""
+		[[ -z "$WALK_NAME" ]] || walk_state="$(walk_state_of "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}")"
+		case "$walk_state" in
+		true | false | failed) continue ;;
+		running)
+			# Unless that run decided after all: then the stop landed as the
+			# verdict was being written, and all that is left is to record it.
+			if review_is_done "$REVIEW_VERDICT"; then
+				[[ "$DRY_RUN" -eq 1 ]] ||
+					walk_record "$(read_verdict "$REVIEW_VERDICT")" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}"
+				continue
+			fi
+			todo_idx+=("$i")
+			continue
+			;;
+		esac
 		if [[ "$failed" -eq 1 ]]; then
 			# Only a decided "false" is a rejection. Missing, malformed and
 			# unfinished runs are pending, and pending is the ordinary
@@ -1132,7 +1338,10 @@ cmd_review_all() {
 	done
 
 	if [[ ${#todo_idx[@]} -eq 0 ]]; then
-		if [[ "$failed" -eq 1 ]]; then
+		if [[ -n "$WALK_NAME" ]]; then
+			printf '%sNothing left in walk "%s".%s It has passed %d entry(ies) of %s; a new walk is a new name.\n' \
+				"$BOLD" "$WALK_NAME" "$RESET" "$(walk_passed_count)" "$plan_file"
+		elif [[ "$failed" -eq 1 ]]; then
 			printf '%sNothing to re-review.%s No active entry in %s has a latest verdict of "false".\n' \
 				"$BOLD" "$RESET" "$plan_file"
 		else
@@ -1145,8 +1354,10 @@ cmd_review_all() {
 	local doing="review"
 	[[ "$failed" -eq 1 ]] && doing="re-review"
 	printf '%s%d branch(es) to %s from %s.%s\n' "$BOLD" "${#todo_idx[@]}" "$doing" "$plan_file" "$RESET"
+	[[ -z "$WALK_NAME" ]] ||
+		note "walk \"$WALK_NAME\": $(walk_passed_count) entry(ies) passed before this run, recorded in $WALK_FILE"
 
-	local done_count=0 failed_count=0 idx branch base pr title verdict review_rc
+	local done_count=0 failed_count=0 idx branch base pr title verdict review_rc resume_this
 	local -a summary=()
 	for idx in "${todo_idx[@]}"; do
 		if [[ "$max" -gt 0 && "$done_count" -ge "$max" ]]; then
@@ -1164,23 +1375,40 @@ cmd_review_all() {
 		step "Reviewing #$pr $branch ($((done_count + 1))/${#todo_idx[@]})"
 		[[ -n "$title" ]] && note "$title"
 
+		# --resume asks to continue an interrupted run, and --force wins over
+		# it — except for the entry a walk was on: the walk is what asks for
+		# that one, and --force speaks for the entries it has not reached.
+		resume_this=0
+		[[ "$RESUME" -eq 1 && "$FORCE" -eq 0 ]] && resume_this=1
+		if [[ -n "$WALK_NAME" ]]; then
+			[[ "$(walk_state_of "$pr" "$branch")" != "running" ]] || resume_this=1
+			[[ "$DRY_RUN" -eq 1 ]] || walk_record running "$pr" "$branch"
+		fi
+
 		review_rc=0
-		run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE" || review_rc=$?
+		run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE" "$resume_this" || review_rc=$?
 		if [[ "$review_rc" -eq 0 ]]; then
 			verdict="$(read_verdict "$REVIEW_VERDICT")"
 			summary+=("$(printf '%-6s #%-5s %s' "${verdict:-dry-run}" "$pr" "$branch")")
+			[[ -z "$WALK_NAME" || "$DRY_RUN" -eq 1 ]] || walk_record "$verdict" "$pr" "$branch"
 		elif [[ -n "$INTERRUPTED" ]]; then
-			# Cut short, not failed: the run is there to be resumed.
+			# Cut short, not failed: the run is there to be resumed, and the
+			# walk keeps the entry as "running" for the same reason.
 			summary+=("$(printf '%-6s #%-5s %s' "paused" "$pr" "$branch")")
 		else
 			failed_count=$((failed_count + 1))
 			summary+=("$(printf '%-6s #%-5s %s' "FAILED" "$pr" "$branch")")
 			if [[ "$keep_going" -eq 0 ]]; then
+				# The train stops here, so this is where the walk stays: the
+				# entry is left "running" and the re-run retries it.
 				printf '\n%sStopped at #%s %s.%s Re-run to resume; --keep-going to push through failures.\n' \
 					"$BOLD" "$pr" "$branch" "$RESET" >&2
 				print_summary "${summary[@]}"
 				return 1
 			fi
+			# Moving past a failure is passing it: the walk records it as such
+			# and the re-run does not come back to it.
+			[[ -z "$WALK_NAME" ]] || walk_record failed "$pr" "$branch"
 		fi
 		# An interrupt ends the train whatever --keep-going says: that flag is
 		# about failures, and being asked to stop is not one. The review that

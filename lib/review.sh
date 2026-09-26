@@ -14,6 +14,9 @@
 #       latest -> 002     symlink onto the newest run
 #       hold              optional: while present, the PR is held back from
 #                         merging; its first line is the reason
+#   <reviews-dir>/walks/<name>
+#                         the reviewer's own record of a review-all train
+#                         (--progress-track); the merge driver never reads it
 #
 # The verdict of record is <latest>/verdict, holding "true" or "false".
 #
