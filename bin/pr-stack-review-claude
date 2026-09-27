@@ -90,9 +90,11 @@
 #       rejections, to be re-reviewed once the code is fixed. Only a decided
 #       "false" qualifies: errored, malformed and unfinished runs are pending,
 #       not rejected, and the ordinary selection is what retries those.
-#       With --progress-track <name> the train is a named walk that survives
-#       being stopped: what it has passed is recorded, and a re-run under the
-#       same name carries on from the entry it was on (see "Walks" below).
+#       The train is a named walk that survives being stopped: what it has
+#       passed is recorded under --progress-track <name>, and a re-run under
+#       the same name carries on from the entry it was on (see "Walks"
+#       below). The name is required; --no-progress-track runs the train
+#       without a walk, resumable by verdicts alone.
 #
 #   status [options] <plan-file>
 #       Show which plan entries have been reviewed and what they came back
@@ -216,7 +218,7 @@ Commands:
         script's local review gate does not look for them.
 
   review-all [options] [--failed] [--max <n>] [--keep-going]
-             [--progress-track <name>] <plan-file>
+             (--progress-track <name> | --no-progress-track) <plan-file>
         Review every not-yet-reviewed active entry in the plan, bottom
         first. Stops at the first failure so nothing is silently skipped;
         --keep-going records the failure and carries on. Re-run to resume.
@@ -241,6 +243,10 @@ Commands:
         rest of the selection. --force and --failed keep their meaning for
         the entries the walk has not reached. A finished walk stays on
         disk; start another under a new name, or delete the file.
+        The name is required: a train that forgot it finds out when it is
+        stopped, which is too late. --no-progress-track runs the train
+        without a walk, resumable by verdicts alone; passing both is an
+        error.
 
   status [--output-dir <dir>] <plan-file>
         Print each plan entry with its review state and verdict.
@@ -1241,7 +1247,7 @@ cmd_review_standalone() {
 # ---------------------------------------------------------------------------
 
 cmd_review_all() {
-	local plan_file="" trunk="main" max=0 keep_going=0 failed=0
+	local plan_file="" trunk="main" max=0 keep_going=0 failed=0 no_walk=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--trunk)
@@ -1271,6 +1277,10 @@ cmd_review_all() {
 				die "--progress-track: a name is letters, digits, '.', '_' and '-' only: $WALK_NAME"
 			shift 2
 			;;
+		--no-progress-track)
+			no_walk=1
+			shift
+			;;
 		--*)
 			parse_common_opt "$@"
 			[[ "$OPT_CONSUMED" -gt 0 ]] || die "unknown option: $1"
@@ -1290,6 +1300,15 @@ cmd_review_all() {
 	# --force alone.
 	[[ "$failed" -eq 0 || "$FORCE" -eq 0 ]] ||
 		die "--failed and --force contradict each other: --failed re-reviews by verdict, --force regardless of it; to redo passed reviews too, drop --failed"
+	# A train is a walk unless told otherwise. Verdicts alone cannot resume a
+	# --force or --failed train (see "Walks" in the header), and a train that
+	# forgot to name its walk finds that out only when it is stopped — too
+	# late. So the walk is not optional: name it, or say in so many words that
+	# this train runs without one. Both at once is a contradiction.
+	[[ "$no_walk" -eq 0 || -z "$WALK_NAME" ]] ||
+		die "--progress-track and --no-progress-track contradict each other: pick one"
+	[[ "$no_walk" -eq 1 || -n "$WALK_NAME" ]] ||
+		die "review-all needs a walk: pass --progress-track <name> so a stopped train can resume, or --no-progress-track to run without one"
 
 	require_tools
 	require_model
