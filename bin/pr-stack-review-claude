@@ -140,6 +140,23 @@
 # are the reviewer's own bookkeeping, and "hold" files remain the only gate
 # beside the verdicts.
 #
+# Systemd scope:
+#
+# claude runs inside a transient systemd user scope (systemd-run --user
+# --scope), stopped as soon as the review pipeline returns. A scope is a
+# cgroup holding claude and every process it ever forks, including the ones a
+# tool shell backgrounded and left behind: those are reparented to init when
+# the shell ends, so nothing that only signals claude — the timeout, Ctrl-C,
+# claude's own shutdown — reaches them, and a busy loop a review started to
+# stress a timing assertion runs until someone notices the load. Stopping the
+# scope kills the whole cgroup. It has to be stopped explicitly: a scope lives
+# while any process in it does, which is exactly the leftover case. The scope
+# is entered by exec, so claude keeps the pid the timeout and the terminal
+# signal, and its exit status passes through unchanged. --no-systemd-scope
+# runs claude as a plain child, for hosts without a user manager. A scope left
+# by a run that was itself killed outright is listed by
+# `systemctl --user list-units 'pr-stack-review-*'` and stopped by hand.
+#
 set -euo pipefail
 
 # resolve_self <path>
@@ -192,6 +209,53 @@ require_tools() {
 require_model() {
 	[[ "$MODEL_SET" -eq 1 ]] ||
 		die "--model is required; pass an empty string to leave the model to claude"
+}
+
+# ---------------------------------------------------------------------------
+# Systemd scope (see the header)
+# ---------------------------------------------------------------------------
+
+# require_systemd_scope
+#
+# Every review command runs this before it touches the worktree, unless
+# --no-systemd-scope was given: a run that finds out at its first review that
+# no user manager answers has already checked a branch out for nothing.
+# Starting a scope is the only honest probe — the manager can be running and
+# still out of reach from a session that has no bus to it.
+require_systemd_scope() {
+	[[ "$SYSTEMD_SCOPE" -eq 1 ]] || return 0
+	systemd-run --user --scope --quiet --collect \
+		--unit="pr-stack-review-probe-$$-$RANDOM.scope" -- true ||
+		die "cannot start a systemd user scope (see above); --no-systemd-scope runs claude without one"
+}
+
+# scope_unit_name <pr>
+#
+# Unique per run: a resumed session is a new process and gets a new scope, and
+# a name a live scope still holds would refuse to start. The branch is not in
+# it, since "/" is not a unit-name character.
+scope_unit_name() {
+	printf 'pr-stack-review-%s-%s-%s.scope' "${1:-standalone}" "$$" "$RANDOM"
+}
+
+# stop_scope <unit>
+#
+# Ends the systemd scope claude ran in and every process still in it. Runs on every path
+# out of the pipeline: normal exit, error, timeout and interrupt alike. Counts
+# what it is about to kill first, so a review that left work behind says so
+# in its log rather than in the load average; the count is best effort (it
+# reads the unified cgroup tree) and the stop does not depend on it. A scope
+# whose last process has already exited is gone by now (--collect), and
+# stopping it is an error that means nothing.
+stop_scope() {
+	local unit="$1" cgroup=""
+	local -a leftovers=()
+	cgroup="$(systemctl --user show --property=ControlGroup --value "$unit" 2>/dev/null)" || cgroup=""
+	[[ -z "$cgroup" || ! -r "/sys/fs/cgroup$cgroup/cgroup.procs" ]] ||
+		mapfile -t leftovers <"/sys/fs/cgroup$cgroup/cgroup.procs"
+	systemctl --user stop "$unit" >/dev/null 2>&1 || true
+	[[ ${#leftovers[@]} -eq 0 ]] ||
+		note "reaped ${#leftovers[@]} process(es) the reviewer left behind"
 }
 
 usage() {
@@ -283,6 +347,13 @@ Options (all review commands):
   --no-tool-limits     do not pass --allowed-tools at all; whatever the
                        permission mode allows is allowed.
   --timeout <seconds>  abort a single review after this long (0: no limit)
+  --systemd-scope      run claude in a transient systemd user scope and stop
+                       the scope once claude has exited, so a process a tool
+                       shell backgrounded and forgot dies with the review
+                       instead of outliving it (default; needs a systemd
+                       user manager reachable from this session)
+  --no-systemd-scope   run claude as a plain child. Whatever a review leaves
+                       behind then survives it until someone finds it
   --force              re-review branches whose latest run already decided,
                        as a new numbered run beside the old one
   --resume             continue an interrupted run instead of starting over:
@@ -831,6 +902,9 @@ MODEL_SET=0
 EFFORT=""
 TIMEOUT=0
 DRY_RUN=0
+# claude runs in a transient systemd user scope unless --no-systemd-scope
+# (see "Systemd scope" in the header).
+SYSTEMD_SCOPE=1
 
 # format_stream
 #
@@ -958,13 +1032,23 @@ run_review() {
 	[[ -n "$MODEL" ]] && claude_cmd+=(--model "$MODEL")
 	[[ -n "$EFFORT" ]] && claude_cmd+=(--effort "$EFFORT")
 	[[ "$TOOL_LIMITS" -eq 1 ]] && claude_cmd+=(--allowed-tools "${ALLOWED_TOOLS[@]}")
+	local scope=""
+	if [[ "$SYSTEMD_SCOPE" -eq 1 ]]; then
+		# Innermost wrapper, around claude alone: systemd-run --scope enters
+		# the unit and execs the command in place, so claude has the pid the
+		# timeout below and the terminal signal, and the pipeline sees claude's
+		# own exit status. stop_scope after the pipeline is the other half.
+		scope="$(scope_unit_name "$pr")"
+		claude_cmd=(systemd-run --user --scope --quiet --collect --unit="$scope" -- "${claude_cmd[@]}")
+	fi
 	if [[ "$TIMEOUT" -gt 0 ]]; then
 		# --foreground keeps timeout in the terminal's process group. Without
 		# it timeout moves into a group of its own, and neither it nor claude
 		# ever hears the terminal's Ctrl-C: the script would sit through the
 		# whole timeout, unable to stop. The cost is that on expiry only claude
 		# itself is signalled, not the tools it has running; claude takes those
-		# down as part of its own shutdown.
+		# down as part of its own shutdown, and what that misses is the
+		# scope's job.
 		claude_cmd=(timeout --foreground --signal=INT "$TIMEOUT" "${claude_cmd[@]}")
 	fi
 
@@ -976,6 +1060,9 @@ run_review() {
 	[[ "$resuming" -eq 1 ]] && capture=(tee -a "$REVIEW_OUTPUT")
 	CLAUDE_RUNNING=1
 	printf '%s' "$prompt" | "${claude_cmd[@]}" | "${capture[@]}" | format_stream || rc=$?
+	# First thing after the pipeline, ahead of the interrupt handling, so an
+	# interrupted review is reaped like any other.
+	[[ -z "$scope" ]] || stop_scope "$scope"
 	# An interrupt that cut the review short is not a failure: the run keeps
 	# its session id and no verdict, which is exactly what --resume looks for.
 	# One that arrived as claude was writing its last file changed nothing —
@@ -1093,6 +1180,14 @@ parse_common_opt() {
 		TOOL_LIMITS=0
 		OPT_CONSUMED=1
 		;;
+	--systemd-scope)
+		SYSTEMD_SCOPE=1
+		OPT_CONSUMED=1
+		;;
+	--no-systemd-scope)
+		SYSTEMD_SCOPE=0
+		OPT_CONSUMED=1
+		;;
 	--force)
 		FORCE=1
 		OPT_CONSUMED=1
@@ -1185,6 +1280,7 @@ cmd_review() {
 
 	require_tools
 	require_model
+	require_systemd_scope
 	claim_worktree
 
 	load_plan "$plan_file"
@@ -1236,6 +1332,7 @@ cmd_review_standalone() {
 
 	require_tools
 	require_model
+	require_systemd_scope
 	claim_worktree
 
 	REVIEW_KIND="standalone"
@@ -1312,6 +1409,7 @@ cmd_review_all() {
 
 	require_tools
 	require_model
+	require_systemd_scope
 	claim_worktree
 	load_plan "$plan_file"
 
