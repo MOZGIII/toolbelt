@@ -43,6 +43,9 @@
 #       is an ancestor of the base (merge commit / fast-forward), or its
 #       pattern matches a commit subject in the newly pulled range (rebase
 #       or squash merges, where hashes are rewritten but subjects survive).
+#       A subject is claimed by the longest active pattern that matches it,
+#       so an entry whose pattern is a prefix of another entry's is not
+#       marked merged when the longer one lands.
 #
 set -euo pipefail
 
@@ -646,9 +649,27 @@ cmd_advance() {
 	local new_subjects=""
 	[[ "$old_tip" != "$new_tip" ]] && new_subjects="$(git log --format='%s' "$old_tip..$new_tip")"
 
+	# Every active pattern in the map, so that a landed subject is claimed by
+	# the most specific pattern only: "Add foo" must not be marked merged when
+	# "Add foo-bar" lands and the map has an entry for that too. A pattern is
+	# shadowed on a subject when a longer active pattern also matches it.
+	# (Collected by hand rather than through parse_map_file, which refuses a
+	# map with no active entries — a drained map is fine here.)
+	local nl=$'\n' active_patterns=""
+	local line stripped pr_branch pattern lineno=0
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		stripped="${line%%#*}"
+		stripped="${stripped#"${stripped%%[![:space:]]*}"}" # ltrim
+		stripped="${stripped%"${stripped##*[![:space:]]}"}" # rtrim
+		[[ -n "$stripped" ]] || continue
+		pr_branch="${stripped%%[[:space:]]*}"
+		pattern="${stripped#"$pr_branch"}"
+		pattern="${pattern#"${pattern%%[![:space:]]*}"}" # ltrim
+		[[ -z "$pattern" ]] || active_patterns+="${pattern}${nl}"
+	done <"$map_file"
+
 	# Rewrite the map: comment out entries whose branch has landed in the base.
-	local nl=$'\n' buf="" merged_branches=()
-	local line stripped pr_branch pattern lineno=0 merged
+	local buf="" merged_branches=() merged
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		lineno=$((lineno + 1))
 
@@ -674,8 +695,16 @@ cmd_advance() {
 			git merge-base --is-ancestor "$pr_branch" "refs/heads/$base"; then
 			merged=1
 		elif [[ -n "$new_subjects" ]] &&
-			printf '%s\n' "$new_subjects" | awk -v p="$pattern" \
-				'index($0, p) && !($0 ~ /^Revert "/ && p !~ /^Revert "/) { found = 1 } END { exit !found }'; then
+			awk -v p="$pattern" '
+				NR == FNR { patterns[NR] = $0; next }
+				index($0, p) && !($0 ~ /^Revert "/ && p !~ /^Revert "/) {
+					shadowed = 0
+					for (i in patterns)
+						if (length(patterns[i]) > length(p) && index($0, patterns[i])) shadowed = 1
+					if (!shadowed) found = 1
+				}
+				END { exit !found }' \
+				<(printf '%s' "$active_patterns") <(printf '%s\n' "$new_subjects"); then
 			merged=1
 		fi
 
