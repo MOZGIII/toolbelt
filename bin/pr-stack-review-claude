@@ -886,6 +886,16 @@ EOF
 # the stack is assert_worktree_undisturbed after the run, not a narrow
 # allowlist before it.
 #
+# Allowing Write is not enough on its own: claude also checks that the path
+# being written lies inside one of its working directories, and it resolves
+# symlinks before checking. A worktree whose .reviews is a symlink into another
+# checkout — the usual arrangement, so every worktree shares one review tree —
+# therefore has its two output files land *outside* the worktree as far as
+# claude is concerned, and the writes are refused exactly like a tool that was
+# never allowed. --add-dir with the output directory's physical path (see
+# resolve_output_dir) is what grants them; the symlinked path does not work,
+# because it is the resolved one that gets compared.
+#
 # ALLOWED_TOOLS is an array because tool specs contain spaces ("Bash(git *)").
 ALLOWED_TOOLS=(
 	Read Bash Write Edit
@@ -1013,6 +1023,7 @@ run_review() {
 	local -a claude_cmd=(
 		claude -p --output-format stream-json --verbose
 		--permission-mode "$PERMISSION_MODE"
+		--add-dir "$OUTPUT_DIR_PHYSICAL"
 		--debug-file "$REVIEW_DEBUG"
 	)
 	# --session-id names the session so it can be found again; --resume picks
@@ -1121,6 +1132,10 @@ run_review() {
 # ---------------------------------------------------------------------------
 
 OUTPUT_DIR=""
+# OUTPUT_DIR with symlinks resolved; set by resolve_output_dir. It exists for
+# claude's --add-dir only (see the ALLOWED_TOOLS comment) — everything else,
+# the prompt and the printed paths included, keeps using OUTPUT_DIR as given.
+OUTPUT_DIR_PHYSICAL=""
 PROMPT_FILE="$PROMPT_FILE_DEFAULT"
 FORCE=0
 RESUME=0
@@ -1215,6 +1230,7 @@ resolve_output_dir() {
 	[[ -n "$OUTPUT_DIR" ]] || OUTPUT_DIR="$root/.reviews"
 	mkdir -p "$OUTPUT_DIR"
 	OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+	OUTPUT_DIR_PHYSICAL="$(cd "$OUTPUT_DIR" && pwd -P)"
 }
 
 # ---------------------------------------------------------------------------
