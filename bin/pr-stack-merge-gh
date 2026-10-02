@@ -967,18 +967,23 @@ poll_checks() {
 	err_file="$(mktemp)"
 	out="$(gh "${args[@]}" --jq '.[] | [.bucket, .name] | @tsv' 2>"$err_file")" || rc=$?
 
-	# gh exits 8 when a PR has no checks at all and nonzero when checks are
-	# failing (with output). Empty output with any other status means the query
-	# itself failed — a network blip, a rate limit, a 5xx.
+	# gh exits 8 when checks are pending and nonzero when checks are failing
+	# (with output). A PR with no checks at all is an error to gh: exit 1, no
+	# output, and "no checks reported on the '<branch>' branch" (or, for a PR
+	# with no commits, "no commit found on the pull request") on stderr. Empty
+	# output with any other message means the query itself failed — a network
+	# blip, a rate limit, a 5xx.
 	if [[ -z "$out" ]]; then
-		if [[ "$rc" -eq 0 || "$rc" -eq 8 ]]; then
+		local message
+		message="$(tr '\n' ' ' <"$err_file" | tr -s ' ')"
+		message="${message#"${message%%[![:space:]]*}"}"
+		message="${message%"${message##*[![:space:]]}"}"
+		if [[ "$rc" -eq 0 || "$rc" -eq 8 ||
+			"$message" == "no checks reported"* || "$message" == "no commit found"* ]]; then
 			rm -f "$err_file"
 			printf 'none\tno checks reported'
 			return 0
 		fi
-		local message
-		message="$(tr '\n' ' ' <"$err_file" | tr -s ' ')"
-		message="${message%"${message##*[![:space:]]}"}"
 		rm -f "$err_file"
 		printf 'error\t%s' "${message:-gh exited $rc}"
 		return 0
