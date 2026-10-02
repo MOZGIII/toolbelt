@@ -25,10 +25,13 @@
 #       any worktree cannot be moved: it is skipped when it already sits on
 #       its matched commit, and aborts the whole remap otherwise.
 #
-#   push [--remote <name>] [--no-force] [--dry-run] <map-file>
+#   push [--remote <name>] [--no-force] [--dry-run] [--only <branch>]...
+#        <map-file>
 #       Push every branch named in the map to the remote, as-is (no
 #       remapping). Verifies all branches exist locally first and aborts if
 #       any are missing. Uses --force-with-lease unless --no-force is given.
+#       With --only, pushes just the named branches; each must be an active
+#       entry in the map, or nothing is pushed.
 #
 #   capture [--base <ref>] [--output <file>] [--include-head] <branch>
 #       The inverse of remap: reconstruct a map file from an existing stack.
@@ -89,10 +92,12 @@ Commands:
         Without --apply, only prints the plan (dry run). With --check, exits
         nonzero unless every branch is already on its matched commit.
 
-  push [--remote <name>] [--no-force] [--dry-run] <map-file>
+  push [--remote <name>] [--no-force] [--dry-run] [--only <branch>]...
+       <map-file>
         Push every branch in the map to <remote> (default: origin) as-is.
         Verifies all branches exist locally first. Uses --force-with-lease
-        unless --no-force is given.
+        unless --no-force is given. --only (repeatable) pushes just the
+        named branches, each of which must be an active map entry.
 
   capture [--base <ref>] [--output <file>] [--include-head] [<branch>]
         Build a map from an existing stack: for each commit in
@@ -487,10 +492,11 @@ cmd_rebase() {
 
 cmd_push() {
 	local remote="origin" dry_run=0 force=1
-	local positional=()
+	local positional=() only=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--remote) remote="${2:-}"; [[ -n "$remote" ]] || die "--remote requires a value"; shift 2 ;;
+		--only) [[ -n "${2:-}" ]] || die "--only requires a value"; only+=("$2"); shift 2 ;;
 		--no-force) force=0; shift ;;
 		--dry-run) dry_run=1; shift ;;
 		-h | --help) usage 0 ;;
@@ -503,6 +509,24 @@ cmd_push() {
 	local map_file="${positional[0]}"
 
 	parse_map_file "$map_file"
+
+	# --only narrows the map down to the named branches, all of which it must
+	# list: a typo would otherwise push nothing and report success.
+	if [[ ${#only[@]} -gt 0 ]]; then
+		local unknown=() selected=() name
+		for name in "${only[@]}"; do
+			printf '%s\n' "${MAP_BRANCHES[@]}" | grep -qxF -- "$name" || unknown+=("$name")
+		done
+		if [[ ${#unknown[@]} -gt 0 ]]; then
+			printf 'error: %d --only branch(es) have no active entry in %s:\n' "${#unknown[@]}" "$map_file" >&2
+			printf '         %s\n' "${unknown[@]}" >&2
+			die "aborting: nothing was pushed"
+		fi
+		for name in "${MAP_BRANCHES[@]}"; do
+			printf '%s\n' "${only[@]}" | grep -qxF -- "$name" && selected+=("$name")
+		done
+		MAP_BRANCHES=("${selected[@]}")
+	fi
 
 	# Verify every branch exists locally before pushing anything.
 	local missing=() i

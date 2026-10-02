@@ -50,6 +50,18 @@
 #         6. rebase the stack onto <base>, pr-stack remap --apply, push;
 #         7. comment the merged PR out of the plan.
 #
+#       The push in step 6 is progressive by default (--progressive-remap):
+#       every local branch is remapped, but only the next PR in the plan is
+#       pushed, after it has been retargeted onto <base>. The branches above
+#       it stay on their old commits on the remote until their own turn, so
+#       a merge restarts CI on one PR rather than on the whole train. Their
+#       heads are never contained in their moved bases, so none of them can
+#       turn into a 0-commit PR, which GitHub would close as merged; their
+#       diffs just show the stale copy of the commit below until they are
+#       pushed. `pr-stack push <map>` brings them all up to date at once.
+#       --no-progressive-remap pushes every mapped branch and retargets the
+#       next PR afterwards, best effort.
+#
 #       Every step is guarded by a state check, so re-running after a failure
 #       resumes rather than redoing. Any problem aborts with a resume hint;
 #       nothing is left half-applied on purpose.
@@ -214,6 +226,7 @@ Commands:
              [--merge-method merge|squash|rebase] [--skip-ci | --no-wait-ci]
              [--skip-approval] [--require-local-review | --no-require-local-review]
              [--local-reviews-dir <path>]
+             [--progressive-remap | --no-progressive-remap]
              [--ci-interval <seconds>]
              [--ci-retry-interval <seconds>] [--ci-timeout <seconds>]
              [--no-checks-timeout <seconds>] [--rerun-cooldown <seconds>]
@@ -254,6 +267,16 @@ Commands:
                        conversations resolved" protection, and like the
                        other gates an open thread is waited on rather than
                        aborted at.
+        --progressive-remap (the default)
+                       after the merge, remap every local branch but push
+                       only the next PR in the plan, retargeted onto <base>
+                       first; the branches above it stay stale on the
+                       remote until their turn, so CI runs on one PR per
+                       merge. `pr-stack push <map>` syncs them all.
+        --no-progressive-remap
+                       push every mapped branch after the merge, then
+                       retarget the next PR. The last of the two flags
+                       given wins.
         --no-wait-ci   abort on the first red or missing CI result, or the
                        first unapproved PR, instead of waiting (the old
                        behaviour, for interactive use).
@@ -1132,6 +1155,7 @@ cmd_merge_next() {
 	local rerun_cooldown=120
 	local required_only=""
 	local require_local_review=1 local_reviews_dir="" allow_unresolved=0
+	local progressive_remap=1
 	local positional=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
@@ -1154,6 +1178,8 @@ cmd_merge_next() {
 		--no-require-local-review) require_local_review=0; shift ;;
 		--local-reviews-dir) local_reviews_dir="${2:-}"; [[ -n "$local_reviews_dir" ]] || die "--local-reviews-dir requires a value"; shift 2 ;;
 		--allow-unresolved) allow_unresolved=1; shift ;;
+		--progressive-remap) progressive_remap=1; shift ;;
+		--no-progressive-remap) progressive_remap=0; shift ;;
 		--skip-ci) skip_ci=1; shift ;;
 		--skip-approval) skip_approval=1; shift ;;
 		--dry-run) dry_run=1; shift ;;
@@ -1177,7 +1203,11 @@ cmd_merge_next() {
 
 	require_tools
 	stack="${stack:-$(current_branch)}"
-	RESUME_HINT="$0 merge-next --base $base --stack $stack $plan_file $map_file"
+	# The remap mode is kept: resuming in the other mode would change which
+	# branches get pushed.
+	local remap_flag="--progressive-remap"
+	[[ "$progressive_remap" -eq 1 ]] || remap_flag="--no-progressive-remap"
+	RESUME_HINT="$0 merge-next --base $base --stack $stack $remap_flag $plan_file $map_file"
 
 	# --- preflight -------------------------------------------------------
 	step "Preflight"
@@ -1266,7 +1296,12 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 			note "  $PR_STACK advance --remote $remote --base $base $map_file"
 			note "  git rebase $base $stack"
 			note "  $PR_STACK remap --apply --base $base $map_file $stack"
-			note "  $PR_STACK push --remote $remote $map_file"
+			if [[ "$progressive_remap" -eq 0 ]]; then
+				note "  $PR_STACK push --remote $remote $map_file"
+			elif [[ ${#PLAN_BRANCHES[@]} -gt 1 ]]; then
+				note "  gh pr edit ${PLAN_NUMBERS[1]} --base $base"
+				note "  $PR_STACK push --remote $remote --only ${PLAN_BRANCHES[1]} $map_file"
+			fi
 			note "  comment #$number out of $plan_file"
 			return 0
 		fi
@@ -1562,10 +1597,32 @@ Then re-run this command: it will see #$number as merged and finish the bookkeep
 		"$PR_STACK" remap --apply --base "$base" "$map_file" "$stack" ||
 			die_resumable "pr-stack remap --apply failed"
 
-		step "Pushing the restacked branches"
-		"$PR_STACK" push --remote "$remote" "$map_file" ||
-			die_resumable "pr-stack push failed" \
-				"Re-run after fixing the push; the merge itself is already done."
+		if [[ "$progressive_remap" -eq 0 ]]; then
+			step "Pushing the restacked branches"
+			"$PR_STACK" push --remote "$remote" "$map_file" ||
+				die_resumable "pr-stack push failed" \
+					"Re-run after fixing the push; the merge itself is already done."
+		elif [[ ${#PLAN_BRANCHES[@]} -gt 1 ]]; then
+			local next_number="${PLAN_NUMBERS[1]}" next_branch="${PLAN_BRANCHES[1]}"
+			# Retarget before the push, not after: the old head is still a
+			# child of the merged branch and not in <base>, so GitHub accepts
+			# the edit, and the push then runs CI once, against <base>.
+			local next_base
+			next_base="$(gh_json pr view "$next_number" --json baseRefName --jq .baseRefName)" ||
+				die_resumable "failed to read PR #$next_number (after retries)"
+			if [[ "$next_base" != "$base" ]]; then
+				step "Retargeting the next PR #$next_number ($next_branch): $next_base -> $base"
+				gh pr edit "$next_number" --base "$base" </dev/null ||
+					die_resumable "failed to retarget PR #$next_number onto $base" \
+						"Nothing was pushed. Re-run after fixing it; the merge itself is already done."
+				note "retargeted"
+			fi
+
+			step "Pushing the next PR's branch ($next_branch)"
+			"$PR_STACK" push --remote "$remote" --only "$next_branch" "$map_file" ||
+				die_resumable "pr-stack push failed" \
+					"Re-run after fixing the push; the merge itself is already done."
+		fi
 	fi
 
 	# --- plan bookkeeping ------------------------------------------------
@@ -1575,7 +1632,8 @@ Then re-run this command: it will see #$number as merged and finish the bookkeep
 	# The next PR still points at the branch we just merged; retarget it now so
 	# it shows a clean diff in the meantime. Best effort: the next merge-next
 	# run retargets it anyway, so a failure here is not worth aborting over.
-	if [[ ${#PLAN_BRANCHES[@]} -gt 1 ]]; then
+	# A progressive remap has retargeted it already, ahead of its push.
+	if [[ "$progressive_remap" -eq 0 && ${#PLAN_BRANCHES[@]} -gt 1 ]]; then
 		local next_number="${PLAN_NUMBERS[1]}" next_branch="${PLAN_BRANCHES[1]}"
 		step "Retargeting the next PR #$next_number ($next_branch) onto $base"
 		if gh pr edit "$next_number" --base "$base" </dev/null; then
@@ -1590,6 +1648,10 @@ Then re-run this command: it will see #$number as merged and finish the bookkeep
 		"$BOLD" "$RESET" "$number" "$branch" "$base"
 	if [[ ${#PLAN_BRANCHES[@]} -gt 1 ]]; then
 		printf 'Next up: #%s %s\n' "${PLAN_NUMBERS[1]}" "${PLAN_BRANCHES[1]}"
+		if [[ "$progressive_remap" -eq 1 && ${#PLAN_BRANCHES[@]} -gt 2 ]]; then
+			printf 'The %d PR(s) above it are stale on %s until their turn; to sync them now: %s push --remote %s %s\n' \
+				"$((${#PLAN_BRANCHES[@]} - 2))" "$remote" "$PR_STACK" "$remote" "$map_file"
+		fi
 	else
 		printf 'That was the last PR in the plan.\n'
 	fi
