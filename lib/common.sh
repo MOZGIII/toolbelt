@@ -44,3 +44,32 @@ current_branch() {
 		die "detached HEAD — specify a branch explicitly"
 	printf '%s' "$b"
 }
+
+# branch_sharing_commit <ref>
+#
+# The one local branch, other than <ref> itself, that points at <ref>'s
+# commit. For a working branch kept on the same commit as a stack head (a
+# "dev" branch that is never pushed as a PR), this is how the stack head is
+# found. Remote-tracking branches are not candidates: the callers verify local
+# branches. Dies unless exactly one branch qualifies; with several, the caller
+# has to be told which one, so they are listed.
+branch_sharing_commit() {
+	local ref="$1" commit self candidates=() b
+	commit="$(git rev-parse --verify --quiet "$ref^{commit}")" ||
+		die "not a commit: $ref"
+	self="$(git rev-parse --symbolic-full-name --verify --quiet "$ref" 2>/dev/null || true)"
+	while IFS= read -r b; do
+		[[ -n "$b" ]] || continue
+		[[ "$b" == "$self" ]] && continue
+		candidates+=("${b#refs/heads/}")
+	done < <(git for-each-ref --points-at "$commit" --format='%(refname)' refs/heads)
+	case ${#candidates[@]} in
+	0) die "no other local branch points at the commit of $ref (${commit:0:12})" ;;
+	1) printf '%s' "${candidates[0]}" ;;
+	*)
+		printf 'error: %d local branches point at the commit of %s:\n' "${#candidates[@]}" "$ref" >&2
+		printf '         %s\n' "${candidates[@]}" >&2
+		die "ambiguous — pass --stack <branch> to pick one"
+		;;
+	esac
+}
