@@ -72,11 +72,13 @@ resolve_self() {
 # mirrors, so this resolves the same way in a checkout as under an install tree.
 PREFIX="$(dirname "$(dirname "$(resolve_self "${BASH_SOURCE[0]}")")")"
 # die() is itself in common.sh, so failing to load it cannot be reported with it.
-# shellcheck source=../lib/common.sh
-. "$PREFIX/lib/common.sh" || {
-	printf 'error: cannot load %s\n' "$PREFIX/lib/common.sh" >&2
-	exit 1
-}
+for module in common remap; do
+	# shellcheck source=/dev/null
+	. "$PREFIX/lib/$module.sh" || {
+		printf 'error: cannot load %s\n' "$PREFIX/lib/$module.sh" >&2
+		exit 1
+	}
+done
 
 # The sequence editor git calls back during `rebase`.
 TODO_EDIT="$PREFIX/libexec/pr-stack-todo-edit"
@@ -146,102 +148,9 @@ EOF
 	exit "${1:-0}"
 }
 
-# parse_map_file <map-file>
-#
-# Reads the map into the global parallel arrays MAP_BRANCHES and MAP_PATTERNS.
-# Skips blank/comment lines. Aborts on a line that has a branch but no pattern.
-MAP_BRANCHES=()
-MAP_PATTERNS=()
-parse_map_file() {
-	local map_file="$1"
-	[[ -f "$map_file" ]] || die "map file not found: $map_file"
-
-	MAP_BRANCHES=()
-	MAP_PATTERNS=()
-	local line pr_branch pattern lineno=0
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		lineno=$((lineno + 1))
-
-		# Strip comments and surrounding whitespace; skip blanks.
-		line="${line%%#*}"
-		line="${line#"${line%%[![:space:]]*}"}" # ltrim
-		line="${line%"${line##*[![:space:]]}"}" # rtrim
-		[[ -n "$line" ]] || continue
-
-		# First whitespace-delimited token is the branch; remainder is pattern.
-		pr_branch="${line%%[[:space:]]*}"
-		pattern="${line#"$pr_branch"}"
-		pattern="${pattern#"${pattern%%[![:space:]]*}"}" # ltrim
-		[[ -n "$pattern" ]] || die "$map_file:$lineno: no commit message pattern for branch $pr_branch"
-
-		MAP_BRANCHES+=("$pr_branch")
-		MAP_PATTERNS+=("$pattern")
-	done <"$map_file"
-
-	[[ ${#MAP_BRANCHES[@]} -gt 0 ]] || die "no usable entries in map file: $map_file"
-}
-
-# resolve_map_commits <base> <branch>
-#
-# Matches every map pattern against the commit subjects in <base>..<branch> and
-# fills PLAN_HASHES / PLAN_SUBJECTS, parallel to MAP_BRANCHES. Each pattern must
-# match exactly one commit; anything else is reported and aborts, so callers can
-# assume a resolved plan or no plan at all. parse_map_file must have run first.
-PLAN_HASHES=()
-PLAN_SUBJECTS=()
-resolve_map_commits() {
-	local base="$1" branch="$2"
-
-	# Snapshot candidate commits once: "<hash><TAB><subject>" per line.
-	local range="$base..$branch"
-	local commits
-	commits="$(git log --reverse --format='%H%x09%s' "$range")"
-	[[ -n "$commits" ]] || die "no commits in range $range"
-
-	PLAN_HASHES=()
-	PLAN_SUBJECTS=()
-	local errors=0 i pattern matches count hash subject exact exact_count
-	for i in "${!MAP_BRANCHES[@]}"; do
-		pattern="${MAP_PATTERNS[$i]}"
-
-		# Literal substring match against subjects, case sensitive.
-		matches="$(printf '%s\n' "$commits" | awk -F'\t' -v p="$pattern" 'index($2, p) { print }')" || true
-		count=0
-		[[ -n "$matches" ]] && count="$(printf '%s\n' "$matches" | grep -c '')"
-
-		# Several substring matches still resolve when exactly one of them is
-		# the whole subject: a later `Revert "<subject>"` contains the original
-		# subject without being it, and capture writes full subjects as
-		# patterns.
-		if [[ "$count" -gt 1 ]]; then
-			exact="$(printf '%s\n' "$matches" | awk -F'\t' -v p="$pattern" '$2 == p { print }')" || true
-			exact_count=0
-			[[ -n "$exact" ]] && exact_count="$(printf '%s\n' "$exact" | grep -c '')"
-			if [[ "$exact_count" -eq 1 ]]; then
-				matches="$exact"
-				count=1
-			fi
-		fi
-
-		if [[ "$count" -eq 0 ]]; then
-			printf 'error: no commit in %s matches "%s" (branch %s)\n' "$range" "$pattern" "${MAP_BRANCHES[$i]}" >&2
-			errors=1; PLAN_HASHES+=("") PLAN_SUBJECTS+=(""); continue
-		fi
-		if [[ "$count" -gt 1 ]]; then
-			printf 'error: %d commits match "%s" (branch %s) — pattern is ambiguous:\n' "$count" "$pattern" "${MAP_BRANCHES[$i]}" >&2
-			printf '%s\n' "$matches" | sed 's/\t/  /;s/^/         /' >&2
-			errors=1; PLAN_HASHES+=("") PLAN_SUBJECTS+=(""); continue
-		fi
-
-		hash="${matches%%$'\t'*}"
-		subject="${matches#*$'\t'}"
-		PLAN_HASHES+=("$hash")
-		PLAN_SUBJECTS+=("$subject")
-	done
-
-	[[ "$errors" -eq 0 ]] || return 1
-	return 0
-}
+# The remap file's format, its parser (parse_remap_file) and the matching of
+# its patterns to commits (resolve_remap_commits) live in lib/remap.sh, shared
+# with the reviewer that reads the same file.
 
 cmd_remap() {
 	local base="main" apply=0 check=0
@@ -265,12 +174,12 @@ cmd_remap() {
 	git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "base ref not found: $base"
 	git rev-parse --verify --quiet "$branch^{commit}" >/dev/null || die "branch not found: $branch"
 
-	parse_map_file "$map_file"
+	parse_remap_file "$map_file"
 
 	local range="$base..$branch"
-	resolve_map_commits "$base" "$branch" ||
+	resolve_remap_commits "$base" "$branch" ||
 		die "aborting: some patterns did not match exactly one commit (no branches were moved)"
-	local plan_hashes=("${PLAN_HASHES[@]}") plan_subjects=("${PLAN_SUBJECTS[@]}")
+	local plan_hashes=("${REMAP_HASHES[@]}") plan_subjects=("${REMAP_SUBJECTS[@]}")
 	local errors=0 i
 
 	# `git branch -f` refuses to move a branch checked out in any worktree.
@@ -280,14 +189,14 @@ cmd_remap() {
 		awk '$1 == "branch" { sub("^refs/heads/", "", $2); print $2 }')"
 
 	local plan_skips=()
-	for i in "${!MAP_BRANCHES[@]}"; do
-		if printf '%s\n' "$checked_out" | grep -qxF "${MAP_BRANCHES[$i]}" &&
-			git show-ref --verify --quiet "refs/heads/${MAP_BRANCHES[$i]}"; then
-			if [[ "$(git rev-parse "refs/heads/${MAP_BRANCHES[$i]}")" == "${plan_hashes[$i]}" ]]; then
+	for i in "${!REMAP_BRANCHES[@]}"; do
+		if printf '%s\n' "$checked_out" | grep -qxF "${REMAP_BRANCHES[$i]}" &&
+			git show-ref --verify --quiet "refs/heads/${REMAP_BRANCHES[$i]}"; then
+			if [[ "$(git rev-parse "refs/heads/${REMAP_BRANCHES[$i]}")" == "${plan_hashes[$i]}" ]]; then
 				plan_skips+=(1)
 			else
 				printf 'error: branch %s is checked out and not on its matched commit %s\n' \
-					"${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}" >&2
+					"${REMAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}" >&2
 				errors=1; plan_skips+=(0)
 			fi
 		else
@@ -300,11 +209,11 @@ cmd_remap() {
 	# without moving anything. Exit status is the answer.
 	if [[ "$check" -eq 1 ]]; then
 		local stale=()
-		for i in "${!MAP_BRANCHES[@]}"; do
-			if ! git show-ref --verify --quiet "refs/heads/${MAP_BRANCHES[$i]}"; then
-				stale+=("${MAP_BRANCHES[$i]}: missing locally, expected ${plan_hashes[$i]:0:12}")
-			elif [[ "$(git rev-parse "refs/heads/${MAP_BRANCHES[$i]}")" != "${plan_hashes[$i]}" ]]; then
-				stale+=("${MAP_BRANCHES[$i]}: at $(git rev-parse --short=12 "refs/heads/${MAP_BRANCHES[$i]}"), expected ${plan_hashes[$i]:0:12}  (${plan_subjects[$i]})")
+		for i in "${!REMAP_BRANCHES[@]}"; do
+			if ! git show-ref --verify --quiet "refs/heads/${REMAP_BRANCHES[$i]}"; then
+				stale+=("${REMAP_BRANCHES[$i]}: missing locally, expected ${plan_hashes[$i]:0:12}")
+			elif [[ "$(git rev-parse "refs/heads/${REMAP_BRANCHES[$i]}")" != "${plan_hashes[$i]}" ]]; then
+				stale+=("${REMAP_BRANCHES[$i]}: at $(git rev-parse --short=12 "refs/heads/${REMAP_BRANCHES[$i]}"), expected ${plan_hashes[$i]:0:12}  (${plan_subjects[$i]})")
 			fi
 		done
 		if [[ ${#stale[@]} -gt 0 ]]; then
@@ -312,13 +221,13 @@ cmd_remap() {
 			printf '         %s\n' "${stale[@]}" >&2
 			die "aborting: run 'remap --apply' to fix"
 		fi
-		printf 'All %d mapped branch(es) are on their matched commits in %s.\n' "${#MAP_BRANCHES[@]}" "$range"
+		printf 'All %d mapped branch(es) are on their matched commits in %s.\n' "${#REMAP_BRANCHES[@]}" "$range"
 		return 0
 	fi
 
 	printf 'Remap plan for stack %s (base %s):\n\n' "$branch" "$base"
-	for i in "${!MAP_BRANCHES[@]}"; do
-		printf '  %-48s -> %s  %s%s\n' "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}" "${plan_subjects[$i]}" \
+	for i in "${!REMAP_BRANCHES[@]}"; do
+		printf '  %-48s -> %s  %s%s\n' "${REMAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}" "${plan_subjects[$i]}" \
 			"$([[ "${plan_skips[$i]}" -eq 1 ]] && printf '  [checked out, already in place]')"
 	done
 	printf '\n'
@@ -329,13 +238,13 @@ cmd_remap() {
 	fi
 
 	local moved=0
-	for i in "${!MAP_BRANCHES[@]}"; do
+	for i in "${!REMAP_BRANCHES[@]}"; do
 		if [[ "${plan_skips[$i]}" -eq 1 ]]; then
-			printf 'skipped %s (checked out, already at %s)\n' "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}"
+			printf 'skipped %s (checked out, already at %s)\n' "${REMAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}"
 			continue
 		fi
-		git branch -f "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]}"
-		printf 'moved %s -> %s\n' "${MAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}"
+		git branch -f "${REMAP_BRANCHES[$i]}" "${plan_hashes[$i]}"
+		printf 'moved %s -> %s\n' "${REMAP_BRANCHES[$i]}" "${plan_hashes[$i]:0:12}"
 		moved=$((moved + 1))
 	done
 	printf '\nDone. %d branch(es) remapped.\n' "$moved"
@@ -368,12 +277,12 @@ collect_boundaries() {
 	RANGE_SUBJECTS=()
 
 	if [[ -n "$map_file" ]]; then
-		parse_map_file "$map_file"
-		resolve_map_commits "$base" "$branch" ||
+		parse_remap_file "$map_file"
+		resolve_remap_commits "$base" "$branch" ||
 			die "aborting: some patterns did not match exactly one commit (nothing was rebased)"
 		local i
-		for i in "${!MAP_BRANCHES[@]}"; do
-			BOUNDARY_LABEL_AT["${PLAN_HASHES[$i]}"]="${MAP_BRANCHES[$i]}"
+		for i in "${!REMAP_BRANCHES[@]}"; do
+			BOUNDARY_LABEL_AT["${REMAP_HASHES[$i]}"]="${REMAP_BRANCHES[$i]}"
 		done
 	else
 		local hash name
@@ -508,31 +417,31 @@ cmd_push() {
 	[[ ${#positional[@]} -eq 1 ]] || usage 1
 	local map_file="${positional[0]}"
 
-	parse_map_file "$map_file"
+	parse_remap_file "$map_file"
 
 	# --only narrows the map down to the named branches, all of which it must
 	# list: a typo would otherwise push nothing and report success.
 	if [[ ${#only[@]} -gt 0 ]]; then
 		local unknown=() selected=() name
 		for name in "${only[@]}"; do
-			printf '%s\n' "${MAP_BRANCHES[@]}" | grep -qxF -- "$name" || unknown+=("$name")
+			printf '%s\n' "${REMAP_BRANCHES[@]}" | grep -qxF -- "$name" || unknown+=("$name")
 		done
 		if [[ ${#unknown[@]} -gt 0 ]]; then
 			printf 'error: %d --only branch(es) have no active entry in %s:\n' "${#unknown[@]}" "$map_file" >&2
 			printf '         %s\n' "${unknown[@]}" >&2
 			die "aborting: nothing was pushed"
 		fi
-		for name in "${MAP_BRANCHES[@]}"; do
+		for name in "${REMAP_BRANCHES[@]}"; do
 			printf '%s\n' "${only[@]}" | grep -qxF -- "$name" && selected+=("$name")
 		done
-		MAP_BRANCHES=("${selected[@]}")
+		REMAP_BRANCHES=("${selected[@]}")
 	fi
 
 	# Verify every branch exists locally before pushing anything.
 	local missing=() i
-	for i in "${!MAP_BRANCHES[@]}"; do
-		git show-ref --verify --quiet "refs/heads/${MAP_BRANCHES[$i]}" ||
-			missing+=("${MAP_BRANCHES[$i]}")
+	for i in "${!REMAP_BRANCHES[@]}"; do
+		git show-ref --verify --quiet "refs/heads/${REMAP_BRANCHES[$i]}" ||
+			missing+=("${REMAP_BRANCHES[$i]}")
 	done
 	if [[ ${#missing[@]} -gt 0 ]]; then
 		printf 'error: %d branch(es) from the map are missing locally:\n' "${#missing[@]}" >&2
@@ -543,10 +452,10 @@ cmd_push() {
 	local push_opts=()
 	[[ "$force" -eq 1 ]] && push_opts+=(--force-with-lease)
 
-	printf 'Pushing %d branch(es) to %s%s:\n' "${#MAP_BRANCHES[@]}" "$remote" \
+	printf 'Pushing %d branch(es) to %s%s:\n' "${#REMAP_BRANCHES[@]}" "$remote" \
 		"$([[ "$force" -eq 1 ]] && printf ' (--force-with-lease)')"
-	for i in "${!MAP_BRANCHES[@]}"; do
-		printf '  %s\n' "${MAP_BRANCHES[$i]}"
+	for i in "${!REMAP_BRANCHES[@]}"; do
+		printf '  %s\n' "${REMAP_BRANCHES[$i]}"
 	done
 	printf '\n'
 
@@ -555,8 +464,8 @@ cmd_push() {
 		return 0
 	fi
 
-	git push "${push_opts[@]}" "$remote" "${MAP_BRANCHES[@]}"
-	printf '\nDone. %d branch(es) pushed.\n' "${#MAP_BRANCHES[@]}"
+	git push "${push_opts[@]}" "$remote" "${REMAP_BRANCHES[@]}"
+	printf '\nDone. %d branch(es) pushed.\n' "${#REMAP_BRANCHES[@]}"
 }
 
 cmd_capture() {
@@ -677,7 +586,7 @@ cmd_advance() {
 	# the most specific pattern only: "Add foo" must not be marked merged when
 	# "Add foo-bar" lands and the map has an entry for that too. A pattern is
 	# shadowed on a subject when a longer active pattern also matches it.
-	# (Collected by hand rather than through parse_map_file, which refuses a
+	# (Collected by hand rather than through parse_remap_file, which refuses a
 	# map with no active entries — a drained map is fine here.)
 	local nl=$'\n' active_patterns=""
 	local line stripped pr_branch pattern lineno=0
