@@ -21,11 +21,19 @@
 # derived from git, never from the order of the file's lines: a branch's
 # parent is the listed branch whose tip is its nearest ancestor — or the base
 # (--base) when nothing listed lies below it. Entries commented out as merged
-# are not read: what has landed is in the base by then. The run refuses to
-# start unless every listed branch sits on the commit its pattern matches in
-# <base>..<stack head>, the same rule as `pr-stack remap --check`: a branch
-# left behind by a rebase would otherwise be reviewed as something it no
-# longer is.
+# are not read: what has landed is in the base by then.
+#
+# A stack that was rebased and not remapped must not be reviewed: its
+# branches still hold what they held before the rebase, so a review of them
+# is a review of code that is no longer the stack. A remap file therefore
+# comes with its stack head (--stack), and the run refuses to start unless
+# every listed branch sits on the commit its pattern matches in
+# <base>..<stack head> — the same rule as `pr-stack remap --check`. The stack
+# head is always passed, never taken from the branch that happens to be
+# checked out: what is reviewed, and against what, does not depend on where
+# the run was started from. --no-remap-check is the explicit way out of the
+# check: the listed branches are reviewed where they are, and the patterns
+# are not read at all. One of the two has to be passed with a remap file.
 #
 # Without a remap file, `review` takes the branch as the whole stack and
 # reviews it against --base. That is the same review in every other respect —
@@ -91,14 +99,14 @@
 #
 # Subcommands:
 #
-#   review [options] [-m|--remap-file <file>] [--base <ref>]
-#          [--stack <branch>] <branch>
+#   review [options] [-m|--remap-file <file>
+#          (--stack <branch> | --no-remap-check)] [--base <ref>] <branch>
 #       Review one branch against its parent. With a remap file the branch
 #       must be listed in it, and its parent is derived as described above;
 #       without one the branch is reviewed against --base directly.
 #
-#   review-all [options] -m|--remap-file <file> [--base <ref>]
-#              [--stack <branch>]
+#   review-all [options] -m|--remap-file <file>
+#              (--stack <branch> | --no-remap-check) [--base <ref>]
 #       Review every entry in the remap file, bottom of the stack first,
 #       skipping the ones already reviewed. Stops at the first failure unless
 #       --keep-going.
@@ -280,8 +288,8 @@ usage() {
 Usage: pr-stack-review-claude <command> [options] [args]
 
 Commands:
-  review [options] [-m|--remap-file <file>] [--base <ref>]
-         [--stack <branch>] <branch>
+  review [options] [-m|--remap-file <file>
+         (--stack <branch> | --no-remap-check)] [--base <ref>] <branch>
         Review one branch against its parent. The branch needs no PR: a
         review is filed under the branch, and the merge gate finds it
         there once a PR exists.
@@ -291,8 +299,9 @@ Commands:
         is reviewed against --base directly. Either way it is the same
         review, filed in the same place.
 
-  review-all [options] -m|--remap-file <file> [--base <ref>]
-             [--stack <branch>] [--failed] [--max <n>] [--keep-going]
+  review-all [options] -m|--remap-file <file>
+             (--stack <branch> | --no-remap-check) [--base <ref>]
+             [--failed] [--max <n>] [--keep-going]
              (--progress-track <name> | --no-progress-track)
         Review every not-yet-reviewed entry in the remap file, bottom of
         the stack first. Stops at the first failure so nothing is silently
@@ -332,17 +341,25 @@ Options (all review commands):
                        the remap file listing the stack's branches, as
                        `pr-stack remap` reads it ("<branch>  <commit message
                        substring>" per line). Required by review-all and
-                       status, optional for review. Every listed branch
-                       must sit on its matched commit in <base>..<stack>,
-                       as `pr-stack remap --check` verifies; the run
-                       refuses to start otherwise
+                       status, optional for review. With review and
+                       review-all it takes one of --stack and
+                       --no-remap-check alongside it
   --base <ref>         what the bottom of the stack is reviewed against
                        (default: main): with a remap file, the branches
                        with no listed branch below them; without one, the
                        branch given to review
-  --stack <branch>     the stack head the remap file is matched against
-                       (default: the branch checked out when the run
-                       starts). Only with --remap-file
+  --stack <branch>     the stack head the remap file is checked against:
+                       every listed branch must sit on the commit its
+                       pattern matches in <base>..<branch>, as
+                       `pr-stack remap --check` verifies, or the run
+                       refuses to start — a stack that was rebased and
+                       not remapped is not reviewed. There is no default:
+                       the branch checked out when the run starts plays
+                       no part in what is reviewed. Only with --remap-file
+  --no-remap-check     review the remap file's branches where they are,
+                       without that check; the patterns are not read.
+                       Only with --remap-file, and not together with
+                       --stack
   --output-dir <dir>   where the per-branch review directories go
                        (default: <repo-root>/.reviews). Each holds one
                        numbered directory per run (001, 002, …) plus a
@@ -425,7 +442,9 @@ STACK_TITLES=()
 # reviewed. The review checks each branch out, so a branch the rebase left
 # behind would be reviewed as the commits it used to hold. Moving branches is
 # pr-stack's job, not this script's, so this stops and says which ones are
-# off.
+# off. It needs the stack head for that — the listed branches cannot say on
+# their own whether the stack has moved on without them — which is why --stack
+# is asked for rather than guessed.
 check_remap() {
 	local remap_file="$1" base="$2" head="$3"
 	git rev-parse --verify --quiet "$head^{commit}" >/dev/null ||
@@ -448,21 +467,23 @@ check_remap() {
 		printf 'error: %d branch(es) of %s are not on their matched commits in %s:\n' \
 			"${#stale[@]}" "$remap_file" "$base..$head" >&2
 		printf '         %s\n' "${stale[@]}" >&2
-		die "nothing is reviewed until they are (pr-stack remap moves them)"
+		die "nothing is reviewed until they are (pr-stack remap moves them; --no-remap-check reviews them where they are)"
 	fi
 }
 
 # load_stack <remap-file> <base> <stack-head>
 #
-# Reads the remap file's branches as a stack, once the remap check against
-# <stack-head> has passed (check_remap).
+# Reads the remap file's branches as a stack. With a <stack-head> the remap
+# check runs first (check_remap); an empty one is --no-remap-check, and the
+# patterns are then never read.
 #
-# The stack itself comes from the branches' own tips: an entry's parent is
-# the listed branch whose tip is its nearest strict ancestor, or <base> when
-# no listed branch lies below it, and the entries are ordered bottom first by
-# how many commits each has on top of <base>. Neither depends on the order of
-# the file's lines. Two branches listed on one commit share a parent and
-# neither is the other's.
+# The stack itself comes from the branches' own tips, the same way with the
+# check and without it: an entry's parent is the listed branch whose tip is
+# its nearest strict ancestor, or <base> when no listed branch lies below it,
+# and the entries are ordered bottom first by how many commits each has on top
+# of <base>. Neither depends on the order of the file's lines, on a stack
+# head, or on the branch checked out when the run started. Two branches listed
+# on one commit share a parent and neither is the other's.
 #
 # Every listed branch has to exist and hold commits on top of <base>: one
 # that does not has nothing to review, and finding that out here costs less
@@ -475,7 +496,7 @@ load_stack() {
 		die "base ref does not resolve: $base"
 
 	parse_remap_file "$remap_file"
-	check_remap "$remap_file" "$base" "$head"
+	[[ -z "$head" ]] || check_remap "$remap_file" "$base" "$head"
 
 	local -A seen=()
 	local -a branches=() unusable=()
@@ -1280,18 +1301,35 @@ FORCE=0
 RESUME=0
 ALLOW_OVERRIDDEN=0
 # Where the stack comes from (see "The stack"). BASE is what the bottom of the
-# stack is reviewed against; STACK_HEAD is empty until --stack is given, and
-# stack_head then falls back to the branch the run started on.
+# stack is reviewed against. STACK_HEAD is what --stack gave, for the remap
+# check, and stays empty without it; NO_REMAP_CHECK is --no-remap-check.
 REMAP_FILE=""
 BASE="main"
 STACK_HEAD=""
+NO_REMAP_CHECK=0
 
-# stack_head
+# require_remap_check_choice
 #
-# The stack head the remap file is matched against: --stack, or the branch
-# that was checked out when the run started (claim_worktree recorded it).
-stack_head() {
-	printf '%s' "${STACK_HEAD:-$ORIG_BRANCH}"
+# With a remap file, exactly one of --stack and --no-remap-check: the check
+# runs against a stack head that was passed, or it is switched off in so many
+# words. There is no default to fall back on, on purpose. The only candidate
+# is the branch checked out when the run starts, and that would make what is
+# reviewed depend on where the run was started from: a train launched from a
+# worktree parked on some other branch would be checked against that branch.
+# Without a remap file there is nothing to check, so both flags are refused
+# rather than ignored.
+require_remap_check_choice() {
+	[[ -z "$STACK_HEAD" || "$NO_REMAP_CHECK" -eq 0 ]] ||
+		die "--stack and --no-remap-check contradict each other: --stack checks the remap file against that stack head, --no-remap-check skips the check"
+	if [[ -z "$REMAP_FILE" ]]; then
+		[[ -z "$STACK_HEAD" ]] ||
+			die "--stack only applies with --remap-file: without one, the branch is reviewed against --base ($BASE) directly"
+		[[ "$NO_REMAP_CHECK" -eq 0 ]] ||
+			die "--no-remap-check only applies with --remap-file: without one, there is no remap file to check"
+		return 0
+	fi
+	[[ -n "$STACK_HEAD" || "$NO_REMAP_CHECK" -eq 1 ]] ||
+		die "a remap file needs its stack head: pass --stack <branch> — the branch the stack is built on, the one \`pr-stack remap\` is run against — so the listed branches are checked against it, or --no-remap-check to review them where they are"
 }
 
 # parse_common_opt <arg> [value...]
@@ -1316,6 +1354,10 @@ parse_common_opt() {
 	--stack)
 		STACK_HEAD="${2:-}"
 		[[ -n "$STACK_HEAD" ]] || die "--stack requires a value"
+		;;
+	--no-remap-check)
+		NO_REMAP_CHECK=1
+		OPT_CONSUMED=1
 		;;
 	--output-dir)
 		OUTPUT_DIR="${2:-}"
@@ -1422,10 +1464,7 @@ cmd_review() {
 		esac
 	done
 	[[ -n "$branch" ]] || usage 1
-	# Without a remap file there is no stack to have a head: the branch is
-	# reviewed against --base and nothing is matched against anything.
-	[[ -n "$REMAP_FILE" || -z "$STACK_HEAD" ]] ||
-		die "--stack only applies with --remap-file: without one, $branch is reviewed against --base ($BASE) directly"
+	require_remap_check_choice
 
 	require_tools
 	require_model
@@ -1434,7 +1473,7 @@ cmd_review() {
 
 	local base="$BASE" title idx
 	if [[ -n "$REMAP_FILE" ]]; then
-		load_stack "$REMAP_FILE" "$BASE" "$(stack_head)"
+		load_stack "$REMAP_FILE" "$BASE" "$STACK_HEAD"
 		idx="$(stack_index_of "$branch")" ||
 			die "branch not listed in $REMAP_FILE: $branch"
 		base="${STACK_PARENTS[$idx]}"
@@ -1506,6 +1545,7 @@ cmd_review_all() {
 	done
 	[[ -n "$REMAP_FILE" ]] ||
 		die "review-all needs the stack: pass --remap-file <file> (-m)"
+	require_remap_check_choice
 	# --force redoes decided entries regardless of what they decided; --failed
 	# selects *by* the decision. Combining them is a contradiction, not a
 	# stronger ask, and the honest spelling of "redo passed ones too" is
@@ -1527,7 +1567,7 @@ cmd_review_all() {
 	require_systemd_scope
 	claim_worktree
 	local remap_file="$REMAP_FILE"
-	load_stack "$remap_file" "$BASE" "$(stack_head)"
+	load_stack "$remap_file" "$BASE" "$STACK_HEAD"
 
 	local root
 	root="$(git rev-parse --show-toplevel)"
