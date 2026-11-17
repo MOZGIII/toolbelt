@@ -1,35 +1,54 @@
 #!/usr/bin/env bash
 #
 # pr-stack-review-claude — run a Claude Code review over one PR branch, or
-# over a whole merge-order plan, one branch at a time.
+# over every branch a remap file lists, one branch at a time.
 #
 # The script owns the git worktree it runs in: it checks out each branch under
 # review, so anything else you are doing must happen in another worktree. The
 # original branch is restored when the run finishes (--no-restore to stay on
 # the last reviewed branch).
 #
+# A branch needs no PR to be reviewed. The reviewer works from branches alone
+# — it never learns a PR number — so a stack can be reviewed, fixed and
+# reviewed again before any of it is opened on GitHub. There is one branch per
+# PR, and the merge gate finds a PR's review through its branch, so what was
+# reviewed here before the PR existed counts once it does.
+#
 # What a branch is reviewed *against* is its parent in the stack, not the
-# trunk: in a chained stack every PR's base is the previous PR's branch, so
-# reviewing against the trunk would re-review everything underneath it. In
-# plan mode the parent is the preceding entry in the plan file (merged ones
-# included, since they are still the chain), and the bottom entry falls back to
-# the trunk (--trunk). That parent is not overridable: a review against some
-# other base is a different question, and review-standalone is where it is
-# asked.
+# base: in a chained stack every PR sits on the previous PR's branch, so
+# reviewing against the base would re-review everything underneath it. With a
+# remap file (--remap-file, the file `pr-stack remap` reads) the parent is
+# derived from git, never from the order of the file's lines: every entry is
+# matched to its commit in <base>..<stack head>, and a branch's parent is the
+# listed branch on the nearest earlier commit — or the base (--base) when
+# nothing listed lies below it. Entries commented out as merged are not read:
+# what has landed is in the base by then. The run refuses to start unless
+# every listed branch sits on its matched commit, the same rule as
+# `pr-stack remap --check`: a branch left behind by a rebase would otherwise
+# be reviewed as something it no longer is.
 #
-# Each branch gets a directory under the output directory, named
-# "<pr-number>-<branch-slug>" so a listing sorts into merge order. Inside it,
-# every review is a numbered run of its own — nothing is ever overwritten, so a
-# re-review can be read against the one it supersedes — with a "latest" symlink
-# onto the newest:
+# Without a remap file, `review` takes the branch as the whole stack and
+# reviews it against --base. That is the same review in every other respect —
+# same directory, same run files, same standing with the merge gate — only
+# the parent is given rather than derived.
 #
-#   .reviews/493-mzg-2026-07-23-transient-bringup-refactor/
+# Each branch gets a directory under the output directory, called after the
+# branch with "/" turned into "-". Inside it, every review is a numbered run
+# of its own — nothing is ever overwritten, so a re-review can be read against
+# the one it supersedes — with a "latest" symlink onto the newest:
+#
+#   .reviews/mzg-2026-07-23-transient-bringup-refactor/
 #       001/ …          first review
 #       002/ …          re-review, e.g. after a push or a prompt change
 #       latest -> 002
 #
+# What a branch holds is not fixed. Between two runs it may have been split
+# in two, reordered, or joined with another branch, so the runs under one
+# directory are not assumed to cover the same commits, and a re-review
+# reviews whatever the branch is now against whatever its parent is now.
+#
 # The symlink moves when a run starts rather than when it finishes, so
-# latest/output.jsonl can be tailed live. Each run directory holds four
+# latest/output.jsonl can be tailed live. Each run directory holds these
 # fixed-name files:
 #
 #   output.jsonl the full conversation as stream-json: one event per thinking
@@ -48,7 +67,7 @@
 #
 # The latest run's verdict file doubles as the completion marker: a branch
 # whose newest run decided something is skipped unless --force is given, so a
-# plan run that dies halfway through resumes where it stopped, and --force
+# review-all run that dies halfway resumes where it stopped, and --force
 # means "review it again into a new run", never "overwrite what is there".
 #
 # The prompt is a template file (default: share/prompts/code-review.md under
@@ -58,33 +77,24 @@
 #   {{BRANCH}}       branch under review
 #   {{BASE}}         branch it is reviewed against (its parent in the stack)
 #   {{RANGE}}        "<base>..<branch>", ready for git log / git diff
-#   {{PR}}           PR number without the "#", empty when unknown
-#   {{TITLE}}        PR title, empty when unknown
+#   {{TITLE}}        subject of the branch's tip commit
 #   {{REPO_ROOT}}    absolute path of the worktree
 #   {{REVIEW_FILE}}  absolute path the review must be written to
 #   {{VERDICT_FILE}} absolute path the verdict must be written to
 #
 # Subcommands:
 #
-#   review [options] <plan-file> <branch>
-#       Review one branch, looked up in the plan for its PR number, title and
-#       parent. The plan is an argument because it is required, and it is
-#       required for more than lookup: a commit can have several branches on it
-#       and so several PRs, so "the PR for this branch" is not a question git
-#       can answer. The plan answers it by listing the PRs in the order they
-#       will be merged.
+#   review [options] [-m|--remap-file <file>] [--base <ref>]
+#          [--stack <branch>] <branch>
+#       Review one branch against its parent. With a remap file the branch
+#       must be listed in it, and its parent is derived as described above;
+#       without one the branch is reviewed against --base directly.
 #
-#   review-standalone [options] [--base <ref>] <branch>
-#       Review a branch that no plan covers — a spike, or a PR not in the merge
-#       order yet — against --base (default: main). Its own command rather
-#       than a flag on `review`, because it cannot answer what `review` answers:
-#       there is no PR number, and the base is asserted rather than derived. Its
-#       run directories and session names are shaped accordingly, and the merge
-#       gate does not look for them, since nothing here claims to review a PR.
-#
-#   review-all [options] <plan-file>
-#       Review every active entry in the plan, bottom first, skipping the ones
-#       already reviewed. Stops at the first failure unless --keep-going.
+#   review-all [options] -m|--remap-file <file> [--base <ref>]
+#              [--stack <branch>]
+#       Review every entry in the remap file, bottom of the stack first,
+#       skipping the ones already reviewed. Stops at the first failure unless
+#       --keep-going.
 #       With --failed the selection flips: instead of the entries not yet
 #       reviewed, take the ones whose latest verdict came back "false" — the
 #       rejections, to be re-reviewed once the code is fixed. Only a decided
@@ -96,13 +106,13 @@
 #       below). The name is required; --no-progress-track runs the train
 #       without a walk, resumable by verdicts alone.
 #
-#   status [options] <plan-file>
-#       Show which plan entries have been reviewed and what they came back
-#       with. Touches neither git nor Claude.
+#   status [--output-dir <dir>] -m|--remap-file <file>
+#       Show which remap-file entries have been reviewed and what they came
+#       back with, in the file's own order. Moves no branch and runs no
+#       Claude.
 #
-# Plan file format is pr-stack-merge-gh's: "<branch>  #<pr-number>
-# <pr-title>", one per line, whole-line "#" comments. Entries commented out as
-# merged are still read, because they are still part of the base chain.
+# Remap file format is pr-stack's (lib/remap.sh): "<branch>  <commit message
+# substring>", one per line, "#" starting a comment.
 #
 # Walks (review-all --progress-track <name>):
 #
@@ -115,8 +125,8 @@
 # entries decided:
 #
 #   .reviews/walks/<name>
-#       # header comments: the plan the walk runs over, when it started
-#       <state>  #<pr-number>  <branch>      one line per entry reached
+#       # header comments: the remap file the walk runs over, when it started
+#       <state>  <branch>                    one line per entry reached
 #
 # The state is "running" while the entry's review is in flight and becomes its
 # verdict ("true" / "false") when the review decides, or "failed" when the
@@ -184,7 +194,7 @@ PROMPT_FILE_DEFAULT="$PREFIX/share/prompts/code-review.md"
 # Reviews run unattended, so nothing may take over the terminal or wait for
 # input; common.sh drops colour when stdout is redirected so logs stay clean.
 # die() is itself in common.sh, so failing to load it cannot be reported with it.
-for module in common plan review; do
+for module in common remap review; do
 	# shellcheck source=/dev/null
 	. "$PREFIX/lib/$module.sh" || {
 		printf 'error: cannot load %s\n' "$PREFIX/lib/$module.sh" >&2
@@ -229,13 +239,13 @@ require_systemd_scope() {
 		die "cannot start a systemd user scope (see above); --no-systemd-scope runs claude without one"
 }
 
-# scope_unit_name <pr>
+# scope_unit_name
 #
 # Unique per run: a resumed session is a new process and gets a new scope, and
-# a name a live scope still holds would refuse to start. The branch is not in
+# a unit a live scope still holds would refuse to start. The branch is not in
 # it, since "/" is not a unit-name character.
 scope_unit_name() {
-	printf 'pr-stack-review-%s-%s-%s.scope' "${1:-standalone}" "$$" "$RANDOM"
+	printf 'pr-stack-review-%s-%s.scope' "$$" "$RANDOM"
 }
 
 # stop_scope <unit>
@@ -263,29 +273,24 @@ usage() {
 Usage: pr-stack-review-claude <command> [options] [args]
 
 Commands:
-  review [options] <plan-file> <branch>
-        Review one branch against its parent, taking its PR number, title
-        and parent from the plan. The plan is an argument, not an option,
-        because it is required: a commit can carry several branches and so
-        several PRs, and what settles which one is under review — and what
-        it is reviewed against — is the plan listing it in merge order.
-        There is deliberately no --base: reviewing against anything else is
-        review-standalone's job, and filing that answer under the PR would
-        let it satisfy the merge gate.
+  review [options] [-m|--remap-file <file>] [--base <ref>]
+         [--stack <branch>] <branch>
+        Review one branch against its parent. The branch needs no PR: a
+        review is filed under the branch, and the merge gate finds it
+        there once a PR exists.
+        With --remap-file the branch must be listed in the file, and its
+        parent is the listed branch on the nearest earlier commit of the
+        stack (the base when none lies below it). Without it the branch
+        is reviewed against --base directly. Either way it is the same
+        review, filed in the same place.
 
-  review-standalone [options] [--base <ref>] <branch>
-        Review a branch no plan covers — a spike, or a PR not in the merge
-        order yet — against --base (default: main). Separate from
-        `review` because it cannot answer what `review` answers: there is
-        no PR number, and the base is asserted rather than derived. Its run
-        directories and session names are shaped accordingly, and the merge
-        script's local review gate does not look for them.
-
-  review-all [options] [--failed] [--max <n>] [--keep-going]
-             (--progress-track <name> | --no-progress-track) <plan-file>
-        Review every not-yet-reviewed active entry in the plan, bottom
-        first. Stops at the first failure so nothing is silently skipped;
-        --keep-going records the failure and carries on. Re-run to resume.
+  review-all [options] -m|--remap-file <file> [--base <ref>]
+             [--stack <branch>] [--failed] [--max <n>] [--keep-going]
+             (--progress-track <name> | --no-progress-track)
+        Review every not-yet-reviewed entry in the remap file, bottom of
+        the stack first. Stops at the first failure so nothing is silently
+        skipped; --keep-going records the failure and carries on. Re-run
+        to resume.
         Ctrl-C stops the train, --keep-going or not, once the running
         review has shut down; that review is left resumable (see --resume).
         A branch whose verdict file is missing or unreadable counts as
@@ -312,12 +317,25 @@ Commands:
         without a walk, resumable by verdicts alone; passing both is an
         error.
 
-  status [--output-dir <dir>] <plan-file>
-        Print each plan entry with its review state and verdict.
+  status [--output-dir <dir>] -m|--remap-file <file>
+        Print each remap-file entry with its review state and verdict.
 
 Options (all review commands):
-  --trunk <branch>     review, review-all only: what the bottom plan entry
-                       is reviewed against (default: main)
+  -m, --remap-file <file>
+                       the remap file listing the stack's branches, as
+                       `pr-stack remap` reads it ("<branch>  <commit message
+                       substring>" per line). Required by review-all and
+                       status, optional for review. Every listed branch
+                       must sit on its matched commit in <base>..<stack>,
+                       as `pr-stack remap --check` verifies; the run
+                       refuses to start otherwise
+  --base <ref>         what the bottom of the stack is reviewed against
+                       (default: main): with a remap file, the branches
+                       with no listed branch below them; without one, the
+                       branch given to review
+  --stack <branch>     the stack head the remap file is matched against
+                       (default: the branch checked out when the run
+                       starts). Only with --remap-file
   --output-dir <dir>   where the per-branch review directories go
                        (default: <repo-root>/.reviews). Each holds one
                        numbered directory per run (001, 002, …) plus a
@@ -364,7 +382,8 @@ Options (all review commands):
                        resumable, and --force wins if both are given.
   --no-restore         stay on the last reviewed branch instead of going
                        back to the branch that was checked out at the start
-  --dry-run            print the plan and the rendered prompt; run nothing
+  --dry-run            print what would be reviewed against what, and the
+                       rendered prompt; run nothing
 
 The worktree must have no modified tracked files: the script checks branches
 out. Untracked files are fine, which is why the default output directory can
@@ -374,56 +393,113 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Plan file handling
+# The stack
 #
-# The format itself lives in lib/plan.sh, shared with the merge driver that
-# writes the same file. What is local to reviewing is which reading to ask for.
+# The remap file's format and the matching of its patterns to commits live in
+# lib/remap.sh, shared with pr-stack. What is local to reviewing is the
+# reading of the result as a stack: which branch lies below which.
 # ---------------------------------------------------------------------------
 
-# load_plan <plan-file>
+# The remap file's entries in stack order, bottom first, parallel to each
+# other: the branch, the branch it is reviewed against, and the subject of the
+# commit it sits on. Filled by load_stack.
+STACK_BRANCHES=()
+STACK_PARENTS=()
+STACK_TITLES=()
+
+# load_stack <remap-file> <base> <stack-head>
 #
-# The plan as reviewing needs it: every entry in file order, merged ones
-# included — they are still links in the base chain, so the entry above one is
-# reviewed against it — and unparseable lines skipped rather than fatal, since
-# a plan file is prose as much as data. A file with no entries at all is an
-# error: every command here is about reviewing what the plan lists.
-load_plan() {
-	parse_plan_file --all "$1"
-	[[ ${#PLAN_BRANCHES[@]} -gt 0 ]] || die "no plan entries found in $1"
+# Matches every entry of the remap file to its commit in <base>..<stack-head>
+# and orders the entries by where their commits lie, which is what makes the
+# order of the file's lines irrelevant. An entry's parent is the listed branch
+# on the nearest strictly earlier commit, or <base> when there is none; two
+# branches listed on one commit share a parent and neither is the other's.
+#
+# Every listed branch has to sit on its matched commit already. The review
+# checks the branch out, so a branch a rebase left behind would be reviewed as
+# the commits it used to hold, against a parent that has moved away from under
+# it. Moving branches is pr-stack's job, not this script's, so this stops and
+# says which ones are off.
+#
+# A branch listed twice is one entry: there is one review per branch.
+load_stack() {
+	local remap_file="$1" base="$2" head="$3"
+	git rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
+		die "base ref does not resolve: $base"
+	git rev-parse --verify --quiet "$head^{commit}" >/dev/null ||
+		die "stack head does not resolve: $head"
+
+	parse_remap_file "$remap_file"
+	resolve_remap_commits "$base" "$head" ||
+		die "$remap_file does not match $base..$head (see above); nothing is reviewed"
+
+	local -a stale=()
+	local i branch
+	for i in "${!REMAP_BRANCHES[@]}"; do
+		branch="${REMAP_BRANCHES[$i]}"
+		if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+			stale+=("$branch: missing locally, expected ${REMAP_HASHES[$i]:0:12}")
+		elif [[ "$(git rev-parse "refs/heads/$branch")" != "${REMAP_HASHES[$i]}" ]]; then
+			stale+=("$branch: at $(git rev-parse --short=12 "refs/heads/$branch"), expected ${REMAP_HASHES[$i]:0:12}  (${REMAP_SUBJECTS[$i]})")
+		fi
+	done
+	if [[ ${#stale[@]} -gt 0 ]]; then
+		printf 'error: %d branch(es) of %s are not on their matched commits in %s:\n' \
+			"${#stale[@]}" "$remap_file" "$base..$head" >&2
+		printf '         %s\n' "${stale[@]}" >&2
+		die "nothing is reviewed until they are (pr-stack remap moves them)"
+	fi
+
+	# Where each commit of the range lies, counted from the bottom.
+	local -A position=()
+	local hash n=0
+	while IFS= read -r hash; do
+		n=$((n + 1))
+		position["$hash"]="$n"
+	done < <(git rev-list --reverse "$base..$head")
+
+	# "<position> <index>" per entry, sorted bottom first; entries on one
+	# commit keep the order the file lists them in.
+	local -A seen=()
+	local order=""
+	for i in "${!REMAP_BRANCHES[@]}"; do
+		branch="${REMAP_BRANCHES[$i]}"
+		[[ -z "${seen[$branch]:-}" ]] || continue
+		seen["$branch"]=1
+		order+="${position[${REMAP_HASHES[$i]}]} $i"$'\n'
+	done
+
+	STACK_BRANCHES=()
+	STACK_PARENTS=()
+	STACK_TITLES=()
+	local pos last_pos=0 parent="$base" below="$base"
+	while read -r pos i; do
+		[[ -n "$pos" ]] || continue
+		if [[ "$pos" -ne "$last_pos" ]]; then
+			# A new commit: everything recorded so far lies below it, and the
+			# nearest of that is the entry recorded last.
+			parent="$below"
+			last_pos="$pos"
+		fi
+		STACK_BRANCHES+=("${REMAP_BRANCHES[$i]}")
+		STACK_PARENTS+=("$parent")
+		STACK_TITLES+=("${REMAP_SUBJECTS[$i]}")
+		below="${REMAP_BRANCHES[$i]}"
+	done < <(printf '%s' "$order" | sort -n -k1,1 -k2,2)
 }
 
-# plan_index_of <branch>
+# stack_index_of <branch>
 #
-# Prints the index of <branch> in the parsed plan, or nothing when absent.
-plan_index_of() {
+# Prints the index of <branch> in the loaded stack; fails when it is absent.
+stack_index_of() {
 	local branch="$1" i
-	for i in "${!PLAN_BRANCHES[@]}"; do
-		if [[ "${PLAN_BRANCHES[$i]}" == "$branch" ]]; then
+	for i in "${!STACK_BRANCHES[@]}"; do
+		if [[ "${STACK_BRANCHES[$i]}" == "$branch" ]]; then
 			printf '%s' "$i"
 			return 0
 		fi
 	done
 	return 1
-}
-
-# plan_parent_of <index> <trunk>
-#
-# The branch the entry at <index> is reviewed against: the preceding plan
-# entry, or <trunk> for the bottom one. A parent branch that no longer exists
-# locally (merged and deleted, say) also falls back to the trunk, since the
-# trunk contains it by then.
-plan_parent_of() {
-	local i="$1" trunk="$2" parent
-	if [[ "$i" -eq 0 ]]; then
-		printf '%s' "$trunk"
-		return 0
-	fi
-	parent="${PLAN_BRANCHES[$((i - 1))]}"
-	if git rev-parse --verify --quiet "refs/heads/$parent" >/dev/null; then
-		printf '%s' "$parent"
-	else
-		printf '%s' "$trunk"
-	fi
 }
 
 # ---------------------------------------------------------------------------
@@ -435,11 +511,9 @@ plan_parent_of() {
 # than agreed by hand. The run files below are this tool's own business — the
 # gate only ever looks at the verdict.
 
-# set_review_paths <output-dir> <pr-number> <branch>
-#
 # One directory per branch, fixed file names inside it: the branch is already
-# identified by the directory, so nothing downstream has to take a name apart
-# to find out what it is looking at.
+# identified by the directory, so nothing downstream has to take a file name
+# apart to find out what it is looking at.
 REVIEW_ROOT=""
 REVIEW_LATEST=""
 REVIEW_DIR=""
@@ -461,15 +535,18 @@ set_run_files() {
 	REVIEW_SESSION="$REVIEW_DIR/session-id"
 }
 
-# set_review_paths <output-dir> <pr-number> <branch>
+# set_review_paths <output-dir> <branch>
 #
 # Points everything at the branch's *most recent* run, which is what reading
 # code (skip checks, status) wants. Writing code calls plan_run_dir afterwards
 # to move onto a fresh one.
 set_review_paths() {
-	local dir="$1"
-	REVIEW_ROOT="$(review_root "$dir" "$2" "$3")"
-	REVIEW_LATEST="$(review_latest_dir "$dir" "$2" "$3")"
+	local dir="$1" branch="$2"
+	# walks/ is the trains' own directory beside the per-branch ones.
+	[[ "$(review_slug "$branch")" != "walks" ]] ||
+		die "branch \"$branch\" cannot be reviewed: its review directory would be $dir/walks, where the walk records live"
+	REVIEW_ROOT="$(review_root "$dir" "$branch")"
+	REVIEW_LATEST="$(review_latest_dir "$dir" "$branch")"
 	set_run_files "$REVIEW_LATEST"
 }
 
@@ -579,67 +656,68 @@ review_is_done() {
 WALK_NAME=""
 WALK_FILE=""
 # The file's comment lines, kept verbatim across rewrites so the walk remembers
-# which plan it runs over and when it started.
+# which remap file it runs over and when it started.
 WALK_HEADER=""
 # Parallel arrays, in the order the train reached the entries.
 WALK_STATES=()
-WALK_NUMBERS=()
 WALK_BRANCHES=()
 
-# load_walk <output-dir> <plan-file>
+# load_walk <output-dir> <remap-file>
 #
-# Points WALK_FILE at the named walk and reads it when it is there. A walk that
-# was started over another plan is refused: the name identifies one train over
-# one plan, and continuing it over a different plan would skip entries on the
-# strength of a record that was never about them. "Another plan" means another
-# file: the plan is recorded and compared by its resolved path, since the same
-# map is reached through a notes symlink from one worktree and directly from
-# the next, and both are one plan.
+# Points WALK_FILE at the walk and reads it when it is there. A walk that was
+# started over another remap file is refused: a walk is one train over one
+# remap file, and continuing it over a different one would skip entries on the
+# strength of a record that was never about them. "Another" means another
+# file: the remap file is recorded and compared by its resolved path, since
+# the same file is reached through a notes symlink from one worktree and
+# directly from the next, and both are one file.
+#
+# A walk recorded before reviews were filed per branch has "#<pr-number>" in
+# its lines and a "# plan:" header; it is refused on its first entry line. It
+# was a train over a merge plan, which this script no longer reads.
 load_walk() {
-	local dir="$1" plan_file="$2" plan
-	plan="$(resolve_self "$plan_file")"
+	local dir="$1" remap_file="$2" remap
+	remap="$(resolve_self "$remap_file")"
 	WALK_FILE="$dir/walks/$WALK_NAME"
 	WALK_STATES=()
-	WALK_NUMBERS=()
 	WALK_BRANCHES=()
 	if [[ ! -f "$WALK_FILE" ]]; then
-		WALK_HEADER="$(printf '# review-all walk "%s"\n# plan: %s\n# started: %s\n# <state>  #<pr-number>  <branch> — running, true, false or failed' \
-			"$WALK_NAME" "$plan" "$(date -u '+%Y-%m-%d %H:%M:%SZ')")"
+		WALK_HEADER="$(printf '# review-all walk "%s"\n# remap file: %s\n# started: %s\n# <state>  <branch> — running, true, false or failed' \
+			"$WALK_NAME" "$remap" "$(date -u '+%Y-%m-%d %H:%M:%SZ')")"
 		return 0
 	fi
 	WALK_HEADER=""
-	local line body state number branch lineno=0 nl=$'\n' recorded_plan=""
+	local line body state branch extra lineno=0 nl=$'\n' recorded_remap=""
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		lineno=$((lineno + 1))
 		body="${line#"${line%%[![:space:]]*}"}" # ltrim
 		[[ -n "$body" ]] || continue
 		if [[ "$body" == \#* ]]; then
 			WALK_HEADER+="${WALK_HEADER:+$nl}$line"
-			[[ "$body" != "# plan: "* ]] || recorded_plan="${body#\# plan: }"
+			[[ "$body" != "# remap file: "* ]] || recorded_remap="${body#\# remap file: }"
 			continue
 		fi
-		read -r state number branch <<<"$body"
+		read -r state branch extra <<<"$body"
 		case "$state" in
 		running | true | false | failed) ;;
 		*) die "$WALK_FILE:$lineno: unknown walk state \"$state\" (expected running, true, false or failed)" ;;
 		esac
-		[[ "$number" =~ ^#[0-9]+$ && -n "$branch" ]] ||
-			die "$WALK_FILE:$lineno: expected \"<state>  #<pr-number>  <branch>\""
+		[[ -n "$branch" && "$branch" != \#* && -z "$extra" ]] ||
+			die "$WALK_FILE:$lineno: expected \"<state>  <branch>\" (a walk recorded per PR number cannot be continued: start one under another name)"
 		WALK_STATES+=("$state")
-		WALK_NUMBERS+=("${number#\#}")
 		WALK_BRANCHES+=("$branch")
 	done <"$WALK_FILE"
-	[[ -z "$recorded_plan" || "$recorded_plan" == "$plan" ]] ||
-		die "walk \"$WALK_NAME\" was started over $recorded_plan, not $plan: pass that plan, or pick another name"
+	[[ -z "$recorded_remap" || "$recorded_remap" == "$remap" ]] ||
+		die "walk \"$WALK_NAME\" was started over $recorded_remap, not $remap: pass that remap file, or pick another name"
 }
 
-# walk_state_of <pr-number> <branch>
+# walk_state_of <branch>
 #
 # The entry's recorded state, or nothing when the walk has not reached it.
 walk_state_of() {
-	local number="$1" branch="$2" i
-	for i in "${!WALK_NUMBERS[@]}"; do
-		if [[ "${WALK_NUMBERS[$i]}" == "$number" && "${WALK_BRANCHES[$i]}" == "$branch" ]]; then
+	local branch="$1" i
+	for i in "${!WALK_BRANCHES[@]}"; do
+		if [[ "${WALK_BRANCHES[$i]}" == "$branch" ]]; then
 			printf '%s' "${WALK_STATES[$i]}"
 			return 0
 		fi
@@ -659,16 +737,16 @@ walk_passed_count() {
 	printf '%s' "$n"
 }
 
-# walk_record <state> <pr-number> <branch>
+# walk_record <state> <branch>
 #
 # Sets the entry's state — appending the entry when the walk reaches it for
 # the first time — and writes the file whole. The write goes through a rename,
 # so a stop that lands mid-write leaves the previous record rather than a
 # truncated one.
 walk_record() {
-	local state="$1" number="$2" branch="$3" i found=0
-	for i in "${!WALK_NUMBERS[@]}"; do
-		if [[ "${WALK_NUMBERS[$i]}" == "$number" && "${WALK_BRANCHES[$i]}" == "$branch" ]]; then
+	local state="$1" branch="$2" i found=0
+	for i in "${!WALK_BRANCHES[@]}"; do
+		if [[ "${WALK_BRANCHES[$i]}" == "$branch" ]]; then
 			WALK_STATES[i]="$state"
 			found=1
 			break
@@ -676,14 +754,13 @@ walk_record() {
 	done
 	if [[ "$found" -eq 0 ]]; then
 		WALK_STATES+=("$state")
-		WALK_NUMBERS+=("$number")
 		WALK_BRANCHES+=("$branch")
 	fi
 	mkdir -p "$(dirname "$WALK_FILE")"
 	{
 		printf '%s\n' "$WALK_HEADER"
 		for i in "${!WALK_STATES[@]}"; do
-			printf '%-8s #%-5s %s\n' "${WALK_STATES[$i]}" "${WALK_NUMBERS[$i]}" "${WALK_BRANCHES[$i]}"
+			printf '%-8s %s\n' "${WALK_STATES[$i]}" "${WALK_BRANCHES[$i]}"
 		done
 	} >"$WALK_FILE.tmp"
 	mv -f "$WALK_FILE.tmp" "$WALK_FILE"
@@ -796,16 +873,15 @@ assert_worktree_undisturbed() {
 # Prompt rendering and the review itself
 # ---------------------------------------------------------------------------
 
-# render_prompt <template> <branch> <base> <pr> <title> <repo-root> <review-file> <verdict-file>
+# render_prompt <template> <branch> <base> <title> <repo-root> <review-file> <verdict-file>
 render_prompt() {
-	local template="$1" branch="$2" base="$3" pr="$4" title="$5" root="$6" review="$7" verdict="$8"
+	local template="$1" branch="$2" base="$3" title="$4" root="$5" review="$6" verdict="$7"
 	[[ -f "$template" ]] || die "prompt template not found: $template"
 	local text
 	text="$(<"$template")"
 	text="${text//\{\{BRANCH\}\}/$branch}"
 	text="${text//\{\{BASE\}\}/$base}"
 	text="${text//\{\{RANGE\}\}/$base..$branch}"
-	text="${text//\{\{PR\}\}/$pr}"
 	text="${text//\{\{TITLE\}\}/$title}"
 	text="${text//\{\{REPO_ROOT\}\}/$root}"
 	text="${text//\{\{REVIEW_FILE\}\}/$review}"
@@ -813,28 +889,19 @@ render_prompt() {
 	printf '%s' "$text"
 }
 
-# session_name <pr-number> <branch>
+# session_name <branch> <base>
 #
-# The display name Claude Code shows for this run's session in the /resume
+# The display label Claude Code shows for this run's session in the /resume
 # picker and the terminal title:
 #
-#     review pr=497 branch=mzg/2026-07-23/update-smoke-test run=001
-#     review-standalone branch=mzg/wip/spike base=main run=001
+#     review branch=mzg/2026-07-23/update-smoke-test base=mzg/2026-07-23/update-vm-cli run=001
 #
-# Within a command every field is always present, in the same order, labelled.
-# The two commands name themselves differently because they are describing
-# different things: a plan review is identified by its PR, a standalone one has
-# no PR to be identified by and is only meaningful alongside the base it was
-# read against. The leading word says which you are looking at, so neither
-# reads as a broken version of the other.
+# Every field is always present, in the same order, labelled. The base is
+# there because a branch alone does not say what a run was about: the same
+# branch reviewed after a reorder is a review against another parent.
 session_name() {
-	local pr="$1" branch="$2" base="$3" run
-	run="$(basename "$REVIEW_DIR")"
-	if [[ "$REVIEW_KIND" == "standalone" ]]; then
-		printf 'review-standalone branch=%s base=%s run=%s' "$branch" "$base" "$run"
-	else
-		printf 'review pr=%s branch=%s run=%s' "$pr" "$branch" "$run"
-	fi
+	local branch="$1" base="$2"
+	printf 'review branch=%s base=%s run=%s' "$branch" "$base" "$(basename "$REVIEW_DIR")"
 }
 
 # render_resume_prompt <review-file> <verdict-file>
@@ -953,7 +1020,7 @@ format_stream() {
 	return 0
 }
 
-# run_review <branch> <base> <pr> <title> <repo-root> <prompt-file> <resume>
+# run_review <branch> <base> <title> <repo-root> <prompt-file> <resume>
 #
 # Checks the branch out, runs Claude, and validates that the two files the
 # prompt asked for actually appeared. Returns nonzero on any of those failing;
@@ -961,7 +1028,7 @@ format_stream() {
 # to continue the branch's interrupted run when there is one: the flags decide
 # that for a single review, and a walk decides it for the entry it was on.
 run_review() {
-	local branch="$1" base="$2" pr="$3" title="$4" root="$5" prompt_file="$6" resume="$7"
+	local branch="$1" base="$2" title="$3" root="$4" prompt_file="$5" resume="$6"
 
 	git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null ||
 		die "branch not found locally: $branch"
@@ -986,7 +1053,7 @@ run_review() {
 	if [[ "$resuming" -eq 1 ]]; then
 		prompt="$(render_resume_prompt "$REVIEW_MD" "$REVIEW_VERDICT")"
 	else
-		prompt="$(render_prompt "$prompt_file" "$branch" "$base" "$pr" "$title" \
+		prompt="$(render_prompt "$prompt_file" "$branch" "$base" "$title" \
 			"$root" "$REVIEW_MD" "$REVIEW_VERDICT")"
 	fi
 
@@ -1038,7 +1105,7 @@ run_review() {
 	if [[ "$resuming" -eq 1 ]]; then
 		claude_cmd+=(--resume "$session_id")
 	else
-		claude_cmd+=(--session-id "$session_id" --name "$(session_name "$pr" "$branch" "$base")")
+		claude_cmd+=(--session-id "$session_id" --name "$(session_name "$branch" "$base")")
 	fi
 	[[ -n "$MODEL" ]] && claude_cmd+=(--model "$MODEL")
 	[[ -n "$EFFORT" ]] && claude_cmd+=(--effort "$EFFORT")
@@ -1049,7 +1116,7 @@ run_review() {
 		# the unit and execs the command in place, so claude has the pid the
 		# timeout below and the terminal signal, and the pipeline sees claude's
 		# own exit status. stop_scope after the pipeline is the other half.
-		scope="$(scope_unit_name "$pr")"
+		scope="$(scope_unit_name)"
 		claude_cmd=(systemd-run --user --scope --quiet --collect --unit="$scope" -- "${claude_cmd[@]}")
 	fi
 	if [[ "$TIMEOUT" -gt 0 ]]; then
@@ -1086,7 +1153,7 @@ run_review() {
 	# transcript.
 	if [[ -n "$INTERRUPTED" ]]; then
 		if ! review_is_done "$REVIEW_VERDICT"; then
-			printf '\n%sInterrupted (%s) during #%s %s.%s\n' "$BOLD" "$INTERRUPTED" "$pr" "$branch" "$RESET" >&2
+			printf '\n%sInterrupted (%s) during %s.%s\n' "$BOLD" "$INTERRUPTED" "$branch" "$RESET" >&2
 			note "run kept in $REVIEW_DIR/; --resume continues its session, --force starts a fresh run"
 			return "$(interrupt_status)"
 		fi
@@ -1139,10 +1206,21 @@ OUTPUT_DIR_PHYSICAL=""
 PROMPT_FILE="$PROMPT_FILE_DEFAULT"
 FORCE=0
 RESUME=0
-# Which command is running: "plan" (review / review-all) or "standalone".
-# Only the naming and the progress line differ; the machinery does not.
-REVIEW_KIND="plan"
 ALLOW_OVERRIDDEN=0
+# Where the stack comes from (see "The stack"). BASE is what the bottom of the
+# stack is reviewed against; STACK_HEAD is empty until --stack is given, and
+# stack_head then falls back to the branch the run started on.
+REMAP_FILE=""
+BASE="main"
+STACK_HEAD=""
+
+# stack_head
+#
+# The stack head the remap file is matched against: --stack, or the branch
+# that was checked out when the run started (claim_worktree recorded it).
+stack_head() {
+	printf '%s' "${STACK_HEAD:-$ORIG_BRANCH}"
+}
 
 # parse_common_opt <arg> [value...]
 #
@@ -1155,6 +1233,18 @@ OPT_CONSUMED=0
 parse_common_opt() {
 	OPT_CONSUMED=2
 	case "$1" in
+	-m | --remap-file)
+		REMAP_FILE="${2:-}"
+		[[ -n "$REMAP_FILE" ]] || die "$1 requires a value"
+		;;
+	--base)
+		BASE="${2:-}"
+		[[ -n "$BASE" ]] || die "--base requires a value"
+		;;
+	--stack)
+		STACK_HEAD="${2:-}"
+		[[ -n "$STACK_HEAD" ]] || die "--stack requires a value"
+		;;
 	--output-dir)
 		OUTPUT_DIR="${2:-}"
 		[[ -n "$OUTPUT_DIR" ]] || die "--output-dir requires a value"
@@ -1234,105 +1324,20 @@ resolve_output_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# review / review-standalone
+# review
 # ---------------------------------------------------------------------------
 
-# start_review <branch> <base> <pr> <title>
+# cmd_review
 #
-# Everything the two single-branch commands do once they know what they are
-# reviewing and what against. They differ only in how they answer that — from a
-# plan, or from arguments — so that is all either one contains.
-start_review() {
-	local branch="$1" base="$2" pr="$3" title="$4"
-
-	local root
-	root="$(git rev-parse --show-toplevel)"
-	resolve_output_dir "$root"
-	set_review_paths "$OUTPUT_DIR" "$pr" "$branch"
-
-	if [[ "$FORCE" -eq 0 && "$DRY_RUN" -eq 0 ]] && review_is_done "$REVIEW_VERDICT"; then
-		die "already reviewed: $REVIEW_VERDICT says $(read_verdict "$REVIEW_VERDICT") (--force to redo)"
-	fi
-
-	if [[ "$REVIEW_KIND" == "standalone" ]]; then
-		step "Reviewing $branch against $base (standalone)"
-	else
-		step "Reviewing #$pr $branch"
-	fi
-	# --resume asks to continue an interrupted run; --force wins if both are given.
-	local resume=0
-	[[ "$RESUME" -eq 1 && "$FORCE" -eq 0 ]] && resume=1
-	run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE" "$resume"
-}
-
+# One branch, against its parent. Where the parent comes from is the only
+# thing --remap-file changes: derived from the stack with it, taken from
+# --base without it. Everything after that — the directory, the run files,
+# the session, what the merge gate later reads — is the same review.
 cmd_review() {
-	local trunk="main" positional=()
+	local branch=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--trunk)
-			trunk="${2:-}"
-			[[ -n "$trunk" ]] || die "--trunk requires a value"
-			shift 2
-			;;
-		--*)
-			parse_common_opt "$@"
-			[[ "$OPT_CONSUMED" -gt 0 ]] || die "unknown option: $1"
-			shift "$OPT_CONSUMED"
-			;;
-		*)
-			positional+=("$1")
-			shift
-			;;
-		esac
-	done
-	# The plan is not a convenience here, it is the only thing that answers
-	# "which PR is this?". A commit can carry several branches and so several
-	# PRs; what makes one of them the answer is that the plan lists it, in the
-	# order it will be merged. Without that there is no PR number, no parent to
-	# review against, and nothing the merge gate can look up — so it is an
-	# argument, not an option.
-	[[ ${#positional[@]} -eq 2 ]] || usage 1
-	local plan_file="${positional[0]}" branch="${positional[1]}"
-
-	require_tools
-	require_model
-	require_systemd_scope
-	claim_worktree
-
-	load_plan "$plan_file"
-	local idx
-	idx="$(plan_index_of "$branch")" ||
-		die "branch not listed in $plan_file: $branch"
-	local pr="${PLAN_NUMBERS[$idx]}" title="${PLAN_TITLES[$idx]}"
-	# The parent, and only the parent: reviewing against another base is
-	# review-standalone's question, and answering it under this PR's directory
-	# would let it satisfy the merge gate.
-	local base
-	base="$(plan_parent_of "$idx" "$trunk")"
-
-	start_review "$branch" "$base" "$pr" "$title"
-}
-
-# review-standalone
-#
-# The plan-less review, kept because it is genuinely useful — a branch with no
-# PR yet, or one whose plan entry does not exist — and kept separate because it
-# cannot answer the questions `review` answers. There is no PR number, and the
-# base is whatever you say it is rather than the branch below it in the merge
-# order. Its artifacts are shaped differently for the same reason, and the
-# merge gate will not find them: nothing here claims to be a review of a PR.
-cmd_review_standalone() {
-	# No --trunk here: with no plan there is no bottom entry to fall back for,
-	# so the trunk would only ever be a second way of spelling --base.
-	local base="main" branch=""
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-		--base)
-			base="${2:-}"
-			[[ -n "$base" ]] || die "--base requires a value"
-			shift 2
-			;;
-		--*)
+		-*)
 			parse_common_opt "$@"
 			[[ "$OPT_CONSUMED" -gt 0 ]] || die "unknown option: $1"
 			shift "$OPT_CONSUMED"
@@ -1345,14 +1350,44 @@ cmd_review_standalone() {
 		esac
 	done
 	[[ -n "$branch" ]] || usage 1
+	# Without a remap file there is no stack to have a head: the branch is
+	# reviewed against --base and nothing is matched against anything.
+	[[ -n "$REMAP_FILE" || -z "$STACK_HEAD" ]] ||
+		die "--stack only applies with --remap-file: without one, $branch is reviewed against --base ($BASE) directly"
 
 	require_tools
 	require_model
 	require_systemd_scope
 	claim_worktree
 
-	REVIEW_KIND="standalone"
-	start_review "$branch" "$base" "" ""
+	local base="$BASE" title idx
+	if [[ -n "$REMAP_FILE" ]]; then
+		load_stack "$REMAP_FILE" "$BASE" "$(stack_head)"
+		idx="$(stack_index_of "$branch")" ||
+			die "branch not listed in $REMAP_FILE: $branch"
+		base="${STACK_PARENTS[$idx]}"
+		title="${STACK_TITLES[$idx]}"
+	else
+		git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null ||
+			die "branch not found locally: $branch"
+		title="$(git log -1 --format=%s "refs/heads/$branch")"
+	fi
+
+	local root
+	root="$(git rev-parse --show-toplevel)"
+	resolve_output_dir "$root"
+	set_review_paths "$OUTPUT_DIR" "$branch"
+
+	if [[ "$FORCE" -eq 0 && "$DRY_RUN" -eq 0 ]] && review_is_done "$REVIEW_VERDICT"; then
+		die "already reviewed: $REVIEW_VERDICT says $(read_verdict "$REVIEW_VERDICT") (--force to redo)"
+	fi
+
+	step "Reviewing $branch against $base"
+	[[ -z "$title" ]] || note "$title"
+	# --resume asks to continue an interrupted run; --force wins if both are given.
+	local resume=0
+	[[ "$RESUME" -eq 1 && "$FORCE" -eq 0 ]] && resume=1
+	run_review "$branch" "$base" "$title" "$root" "$PROMPT_FILE" "$resume"
 }
 
 # ---------------------------------------------------------------------------
@@ -1360,14 +1395,9 @@ cmd_review_standalone() {
 # ---------------------------------------------------------------------------
 
 cmd_review_all() {
-	local plan_file="" trunk="main" max=0 keep_going=0 failed=0 no_walk=0
+	local max=0 keep_going=0 failed=0 no_walk=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--trunk)
-			trunk="${2:-}"
-			[[ -n "$trunk" ]] || die "--trunk requires a value"
-			shift 2
-			;;
 		--failed)
 			failed=1
 			shift
@@ -1394,19 +1424,16 @@ cmd_review_all() {
 			no_walk=1
 			shift
 			;;
-		--*)
+		-*)
 			parse_common_opt "$@"
 			[[ "$OPT_CONSUMED" -gt 0 ]] || die "unknown option: $1"
 			shift "$OPT_CONSUMED"
 			;;
-		*)
-			[[ -z "$plan_file" ]] || die "unexpected argument: $1"
-			plan_file="$1"
-			shift
-			;;
+		*) die "unexpected argument: $1 (the remap file is passed with --remap-file)" ;;
 		esac
 	done
-	[[ -n "$plan_file" ]] || usage 1
+	[[ -n "$REMAP_FILE" ]] ||
+		die "review-all needs the stack: pass --remap-file <file> (-m)"
 	# --force redoes decided entries regardless of what they decided; --failed
 	# selects *by* the decision. Combining them is a contradiction, not a
 	# stronger ask, and the honest spelling of "redo passed ones too" is
@@ -1427,23 +1454,23 @@ cmd_review_all() {
 	require_model
 	require_systemd_scope
 	claim_worktree
-	load_plan "$plan_file"
+	local remap_file="$REMAP_FILE"
+	load_stack "$remap_file" "$BASE" "$(stack_head)"
 
 	local root
 	root="$(git rev-parse --show-toplevel)"
 	resolve_output_dir "$root"
-	[[ -z "$WALK_NAME" ]] || load_walk "$OUTPUT_DIR" "$plan_file"
+	[[ -z "$WALK_NAME" ]] || load_walk "$OUTPUT_DIR" "$remap_file"
 
 	local -a todo_idx=()
 	local i walk_state
-	for i in "${!PLAN_BRANCHES[@]}"; do
-		[[ "${PLAN_ACTIVE[$i]}" -eq 1 ]] || continue
-		set_review_paths "$OUTPUT_DIR" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}"
+	for i in "${!STACK_BRANCHES[@]}"; do
+		set_review_paths "$OUTPUT_DIR" "${STACK_BRANCHES[$i]}"
 		# The walk speaks first: what it has passed is passed whatever it
 		# decided, and the entry it was on is taken whatever the flags would
 		# select — its run has no verdict yet, so --failed alone would drop it.
 		walk_state=""
-		[[ -z "$WALK_NAME" ]] || walk_state="$(walk_state_of "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}")"
+		[[ -z "$WALK_NAME" ]] || walk_state="$(walk_state_of "${STACK_BRANCHES[$i]}")"
 		case "$walk_state" in
 		true | false | failed) continue ;;
 		running)
@@ -1451,7 +1478,7 @@ cmd_review_all() {
 			# verdict was being written, and all that is left is to record it.
 			if review_is_done "$REVIEW_VERDICT"; then
 				[[ "$DRY_RUN" -eq 1 ]] ||
-					walk_record "$(read_verdict "$REVIEW_VERDICT")" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}"
+					walk_record "$(read_verdict "$REVIEW_VERDICT")" "${STACK_BRANCHES[$i]}"
 				continue
 			fi
 			todo_idx+=("$i")
@@ -1473,39 +1500,38 @@ cmd_review_all() {
 	if [[ ${#todo_idx[@]} -eq 0 ]]; then
 		if [[ -n "$WALK_NAME" ]]; then
 			printf '%sNothing left in walk "%s".%s It has passed %d entry(ies) of %s; a new walk is a new name.\n' \
-				"$BOLD" "$WALK_NAME" "$RESET" "$(walk_passed_count)" "$plan_file"
+				"$BOLD" "$WALK_NAME" "$RESET" "$(walk_passed_count)" "$remap_file"
 		elif [[ "$failed" -eq 1 ]]; then
-			printf '%sNothing to re-review.%s No active entry in %s has a latest verdict of "false".\n' \
-				"$BOLD" "$RESET" "$plan_file"
+			printf '%sNothing to re-review.%s No entry in %s has a latest verdict of "false".\n' \
+				"$BOLD" "$RESET" "$remap_file"
 		else
-			printf '%sNothing to review.%s Every active entry in %s already has a verdict.\n' \
-				"$BOLD" "$RESET" "$plan_file"
+			printf '%sNothing to review.%s Every entry in %s already has a verdict.\n' \
+				"$BOLD" "$RESET" "$remap_file"
 		fi
 		return 0
 	fi
 
 	local doing="review"
 	[[ "$failed" -eq 1 ]] && doing="re-review"
-	printf '%s%d branch(es) to %s from %s.%s\n' "$BOLD" "${#todo_idx[@]}" "$doing" "$plan_file" "$RESET"
+	printf '%s%d branch(es) to %s from %s.%s\n' "$BOLD" "${#todo_idx[@]}" "$doing" "$remap_file" "$RESET"
 	[[ -z "$WALK_NAME" ]] ||
 		note "walk \"$WALK_NAME\": $(walk_passed_count) entry(ies) passed before this run, recorded in $WALK_FILE"
 
-	local done_count=0 failed_count=0 idx branch base pr title verdict review_rc resume_this
+	local done_count=0 failed_count=0 idx branch base title verdict review_rc resume_this
 	local -a summary=()
 	for idx in "${todo_idx[@]}"; do
 		if [[ "$max" -gt 0 && "$done_count" -ge "$max" ]]; then
-			printf '\n%sStopping after %d review(s)%s (--max); %d left in the plan, re-run to continue.\n' \
+			printf '\n%sStopping after %d review(s)%s (--max); %d left in the stack, re-run to continue.\n' \
 				"$BOLD" "$done_count" "$RESET" "$((${#todo_idx[@]} - done_count))"
 			break
 		fi
 
-		branch="${PLAN_BRANCHES[$idx]}"
-		pr="${PLAN_NUMBERS[$idx]}"
-		title="${PLAN_TITLES[$idx]}"
-		base="$(plan_parent_of "$idx" "$trunk")"
-		set_review_paths "$OUTPUT_DIR" "$pr" "$branch"
+		branch="${STACK_BRANCHES[$idx]}"
+		title="${STACK_TITLES[$idx]}"
+		base="${STACK_PARENTS[$idx]}"
+		set_review_paths "$OUTPUT_DIR" "$branch"
 
-		step "Reviewing #$pr $branch ($((done_count + 1))/${#todo_idx[@]})"
+		step "Reviewing $branch against $base ($((done_count + 1))/${#todo_idx[@]})"
 		[[ -n "$title" ]] && note "$title"
 
 		# --resume asks to continue an interrupted run, and --force wins over
@@ -1514,41 +1540,41 @@ cmd_review_all() {
 		resume_this=0
 		[[ "$RESUME" -eq 1 && "$FORCE" -eq 0 ]] && resume_this=1
 		if [[ -n "$WALK_NAME" ]]; then
-			[[ "$(walk_state_of "$pr" "$branch")" != "running" ]] || resume_this=1
-			[[ "$DRY_RUN" -eq 1 ]] || walk_record running "$pr" "$branch"
+			[[ "$(walk_state_of "$branch")" != "running" ]] || resume_this=1
+			[[ "$DRY_RUN" -eq 1 ]] || walk_record running "$branch"
 		fi
 
 		review_rc=0
-		run_review "$branch" "$base" "$pr" "$title" "$root" "$PROMPT_FILE" "$resume_this" || review_rc=$?
+		run_review "$branch" "$base" "$title" "$root" "$PROMPT_FILE" "$resume_this" || review_rc=$?
 		if [[ "$review_rc" -eq 0 ]]; then
 			verdict="$(read_verdict "$REVIEW_VERDICT")"
-			summary+=("$(printf '%-6s #%-5s %s' "${verdict:-dry-run}" "$pr" "$branch")")
-			[[ -z "$WALK_NAME" || "$DRY_RUN" -eq 1 ]] || walk_record "$verdict" "$pr" "$branch"
+			summary+=("$(printf '%-7s %s' "${verdict:-dry-run}" "$branch")")
+			[[ -z "$WALK_NAME" || "$DRY_RUN" -eq 1 ]] || walk_record "$verdict" "$branch"
 		elif [[ -n "$INTERRUPTED" ]]; then
 			# Cut short, not failed: the run is there to be resumed, and the
 			# walk keeps the entry as "running" for the same reason.
-			summary+=("$(printf '%-6s #%-5s %s' "paused" "$pr" "$branch")")
+			summary+=("$(printf '%-7s %s' "paused" "$branch")")
 		else
 			failed_count=$((failed_count + 1))
-			summary+=("$(printf '%-6s #%-5s %s' "FAILED" "$pr" "$branch")")
+			summary+=("$(printf '%-7s %s' "FAILED" "$branch")")
 			if [[ "$keep_going" -eq 0 ]]; then
 				# The train stops here, so this is where the walk stays: the
 				# entry is left "running" and the re-run retries it.
-				printf '\n%sStopped at #%s %s.%s Re-run to resume; --keep-going to push through failures.\n' \
-					"$BOLD" "$pr" "$branch" "$RESET" >&2
+				printf '\n%sStopped at %s.%s Re-run to resume; --keep-going to push through failures.\n' \
+					"$BOLD" "$branch" "$RESET" >&2
 				print_summary "${summary[@]}"
 				return 1
 			fi
 			# Moving past a failure is passing it: the walk records it as such
 			# and the re-run does not come back to it.
-			[[ -z "$WALK_NAME" ]] || walk_record failed "$pr" "$branch"
+			[[ -z "$WALK_NAME" ]] || walk_record failed "$branch"
 		fi
 		# An interrupt ends the train whatever --keep-going says: that flag is
 		# about failures, and being asked to stop is not one. The review that
 		# was running has either been recorded above or is waiting for --resume.
 		if [[ -n "$INTERRUPTED" ]]; then
-			printf '\n%sInterrupted at #%s %s.%s Re-run to continue the train.\n' \
-				"$BOLD" "$pr" "$branch" "$RESET" >&2
+			printf '\n%sInterrupted at %s.%s Re-run to continue the train.\n' \
+				"$BOLD" "$branch" "$RESET" >&2
 			print_summary "${summary[@]}"
 			return "$(interrupt_status)"
 		fi
@@ -1574,40 +1600,46 @@ print_summary() {
 # ---------------------------------------------------------------------------
 
 cmd_status() {
-	local plan_file=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
+		-m | --remap-file)
+			REMAP_FILE="${2:-}"
+			[[ -n "$REMAP_FILE" ]] || die "$1 requires a value"
+			shift 2
+			;;
 		--output-dir)
 			OUTPUT_DIR="${2:-}"
 			[[ -n "$OUTPUT_DIR" ]] || die "--output-dir requires a value"
 			shift 2
 			;;
 		-h | --help) usage 0 ;;
-		--*) die "unknown option: $1" ;;
-		*)
-			[[ -z "$plan_file" ]] || die "unexpected argument: $1"
-			plan_file="$1"
-			shift
-			;;
+		-*) die "unknown option: $1" ;;
+		*) die "unexpected argument: $1 (the remap file is passed with --remap-file)" ;;
 		esac
 	done
-	[[ -n "$plan_file" ]] || usage 1
+	[[ -n "$REMAP_FILE" ]] ||
+		die "status needs the stack: pass --remap-file <file> (-m)"
 
-	load_plan "$plan_file"
+	# The file's own order, and no matching against commits: status reports
+	# what the review tree holds for each listed branch, which does not depend
+	# on where the branches sit.
+	parse_remap_file "$REMAP_FILE"
 
 	local root
 	root="$(git rev-parse --show-toplevel)" || die "not inside a git repository"
 	[[ -n "$OUTPUT_DIR" ]] || OUTPUT_DIR="$root/.reviews"
 
-	printf 'Plan %s (reviews in %s)\n\n' "$plan_file" "$OUTPUT_DIR"
+	printf 'Remap file %s (reviews in %s)\n\n' "$REMAP_FILE" "$OUTPUT_DIR"
 	local i state verdict runs pending=0
-	for i in "${!PLAN_BRANCHES[@]}"; do
-		set_review_paths "$OUTPUT_DIR" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}"
+	local -A seen=()
+	for i in "${!REMAP_BRANCHES[@]}"; do
+		# A branch listed twice is one entry, as in load_stack.
+		[[ -z "${seen[${REMAP_BRANCHES[$i]}]:-}" ]] || continue
+		seen["${REMAP_BRANCHES[$i]}"]=1
+		set_review_paths "$OUTPUT_DIR" "${REMAP_BRANCHES[$i]}"
 		verdict="$(read_verdict "$REVIEW_VERDICT")"
 		runs="$(count_runs)"
-		if [[ "${PLAN_ACTIVE[$i]}" -eq 0 ]]; then
-			state="merged"
-		elif review_is_done "$REVIEW_VERDICT"; then
+		if review_is_done "$REVIEW_VERDICT"; then
 			state="$verdict"
 		elif [[ -s "$REVIEW_LATEST/session-id" ]]; then
 			# Started and never finished: --resume can pick this one up.
@@ -1618,11 +1650,11 @@ cmd_status() {
 			state="${verdict:-pending}"
 			pending=$((pending + 1))
 		fi
-		printf '  %-9s %-8s #%-5s %s\n' "$state" \
+		printf '  %-9s %-9s %s\n' "$state" \
 			"$([[ "$runs" -gt 0 ]] && printf '%s run(s)' "$runs" || printf '')" \
-			"${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}"
+			"${REMAP_BRANCHES[$i]}"
 	done
-	printf '\n%d active entry(ies) still pending review.\n' "$pending"
+	printf '\n%d entry(ies) still pending review.\n' "$pending"
 }
 
 [[ $# -gt 0 ]] || usage 1
@@ -1630,9 +1662,8 @@ command="$1"
 shift
 case "$command" in
 review) cmd_review "$@" ;;
-review-standalone) cmd_review_standalone "$@" ;;
 review-all) cmd_review_all "$@" ;;
 status) cmd_status "$@" ;;
 -h | --help) usage 0 ;;
-*) die "unknown command: $command (expected 'review', 'review-standalone', 'review-all', or 'status')" ;;
+*) die "unknown command: $command (expected 'review', 'review-all', or 'status')" ;;
 esac

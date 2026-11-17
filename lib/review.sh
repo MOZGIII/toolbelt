@@ -8,56 +8,60 @@
 # directory nothing ever writes and waits for a verdict that cannot arrive.
 # Hence one definition, here, rather than two kept in step by hand.
 #
-#   <reviews-dir>/<pr-number>-<branch-slug>/
+#   <reviews-dir>/<branch-slug>/
 #       001/ …            one directory per run; nothing is ever overwritten
 #       002/ …
 #       latest -> 002     symlink onto the newest run
-#       hold              optional: while present, the PR is held back from
-#                         merging; its first line is the reason
+#       hold              optional: while present, the branch's PR is held
+#                         back from merging; its first line is the reason
 #   <reviews-dir>/walks/<name>
 #                         the reviewer's own record of a review-all train
 #                         (--progress-track); the merge driver never reads it
 #
 # The verdict of record is <latest>/verdict, holding "true" or "false".
 #
-# The hold is not part of the review: it only shares the PR's directory. It is
-# the operator's "not this one yet", for any reason at all, and a gate of its
-# own — independent of every verdict. A review run neither creates nor removes
-# it.
-
-# review_slug <pr-number> <branch>
+# A review belongs to its branch and to nothing else. There is one branch per
+# PR, so the merge driver finds a PR's review through the branch its plan
+# lists for it — and a branch reviewed before its PR was opened is already
+# reviewed once the PR exists, with no step in between to forget. The reviewer
+# itself never learns a PR number.
 #
-# The directory a branch's reviews are filed under. The PR number leads so a
-# listing sorts into merge order; the branch follows so the directory is
-# readable. Without a number (a standalone review, which no PR covers) the
-# slug is the branch alone.
+# What a branch holds is not fixed: between two runs it may have been split,
+# reordered or joined with another, so the runs under one slug are not
+# assumed to cover the same commits.
+#
+# The hold is not part of the review: it only shares the branch's directory.
+# It is the operator's "not this one yet", for any reason at all, and a gate
+# of its own — independent of every verdict. A review run neither creates nor
+# removes it.
+
+# review_slug <branch>
+#
+# The directory a branch's reviews are filed under: the branch with every
+# character a path component cannot safely hold turned into "-".
 review_slug() {
-	local number="$1" branch="$2" slug
+	local branch="$1" slug
 	slug="${branch//\//-}"
 	slug="${slug//[^A-Za-z0-9._-]/-}"
-	if [[ -n "$number" ]]; then
-		printf '%s-%s' "$number" "$slug"
-	else
-		printf '%s' "$slug"
-	fi
+	printf '%s' "$slug"
 }
 
-# review_root <reviews-dir> <pr-number> <branch>
+# review_root <reviews-dir> <branch>
 review_root() {
-	printf '%s/%s' "$1" "$(review_slug "$2" "$3")"
+	printf '%s/%s' "$1" "$(review_slug "$2")"
 }
 
-# review_latest_dir <reviews-dir> <pr-number> <branch>
+# review_latest_dir <reviews-dir> <branch>
 review_latest_dir() {
 	printf '%s/latest' "$(review_root "$@")"
 }
 
-# review_verdict_file <reviews-dir> <pr-number> <branch>
+# review_verdict_file <reviews-dir> <branch>
 review_verdict_file() {
 	printf '%s/verdict' "$(review_latest_dir "$@")"
 }
 
-# review_hold_file <reviews-dir> <pr-number> <branch>
+# review_hold_file <reviews-dir> <branch>
 review_hold_file() {
 	printf '%s/hold' "$(review_root "$@")"
 }

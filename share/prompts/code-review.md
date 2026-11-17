@@ -2,7 +2,7 @@
 Prompt template for pr-stack-review-claude.sh.
 
 Placeholder names (double-braced, spelled bare here so they survive this
-comment): BRANCH, BASE, RANGE, PR, TITLE, REPO_ROOT, REVIEW_FILE,
+comment): BRANCH, BASE, RANGE, TITLE, REPO_ROOT, REVIEW_FILE,
 VERDICT_FILE. Every occurrence in this file is substituted before the run,
 including inside comments, so keep prose about them brace-free.
 
@@ -13,7 +13,7 @@ and the script fails the branch and stops the train. What Claude prints is
 captured separately, so the transcript is never the deliverable.
 -->
 
-Review pull request #{{PR}} — {{TITLE}}.
+Review branch `{{BRANCH}}` — {{TITLE}}.
 
 `{{BRANCH}}` is checked out at `{{REPO_ROOT}}`. It sits on top of `{{BASE}}`
 in a stacked-PR train, so its parent branch is already known and the scope of

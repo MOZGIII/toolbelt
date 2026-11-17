@@ -121,7 +121,12 @@
 #       Like the other gates it is waited on and reported alongside them, so
 #       `unhold` releases the train in place. `hold` and `unhold` write and
 #       remove the hold file for a PR in the plan; the file lives at
-#       <reviews-dir>/<pr>-<branch-slug>/hold (see lib/review.sh).
+#       <reviews-dir>/<branch-slug>/hold (see lib/review.sh).
+#
+#       Reviews and holds are both filed under the PR's branch, not its
+#       number: the plan says which branch a PR is, and that branch's
+#       directory is where the gate looks. A branch reviewed before its PR
+#       was opened is therefore already reviewed as far as this gate goes.
 #
 # Plan file format: "<branch-name>  #<pr-number>  <pr-title>", one per line.
 # Unlike map files, only whole-line "#" comments are recognised (a PR number
@@ -261,7 +266,7 @@ Commands:
                        require a local review verdict of "true" for this
                        PR, from the newest run under the reviews directory
                        (as written by pr-stack-review-claude:
-                       <pr>-<branch-slug>/latest/verdict). A missing,
+                       <branch-slug>/latest/verdict). A missing,
                        false or malformed verdict blocks the merge. Like
                        the other gates this is waited on, not aborted at,
                        so reviewing in another terminal releases the train.
@@ -340,7 +345,7 @@ Commands:
 
   hold [--local-reviews-dir <path>] <plan-file> <pr-number> [<reason>...]
         Hold a PR in the plan back from merging: writes
-        <reviews-dir>/<pr>-<branch-slug>/hold with the reason as its
+        <reviews-dir>/<branch-slug>/hold with the reason as its
         first line. merge-next waits on the file whatever the flags;
         status shows it in the hold column. Re-running replaces the
         reason. Nothing on GitHub is touched.
@@ -590,8 +595,8 @@ cmd_status() {
 		else
 			thread_label="?"
 		fi
-		local_label="$(local_review_label "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
-		hold_label="$(hold_label "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
+		local_label="$(local_review_label "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
+		hold_label="$(hold_label "${PLAN_BRANCHES[$i]}" "$local_reviews_dir")"
 		[[ "$label" == "approved" ]] && approved=$((approved + 1))
 		[[ "$local_label" == "ready" ]] && reviewed=$((reviewed + 1))
 		[[ "$hold_label" == "held" ]] && held=$((held + 1))
@@ -665,7 +670,7 @@ cmd_hold() {
 	parse_hold_args hold "$@"
 	local branch hold_file
 	branch="$(plan_branch_for "$HOLD_PLAN" "$HOLD_NUMBER")"
-	hold_file="$(review_hold_file "$HOLD_DIR" "$HOLD_NUMBER" "$branch")"
+	hold_file="$(review_hold_file "$HOLD_DIR" "$branch")"
 	mkdir -p "$(dirname "$hold_file")"
 	printf '%s\n' "${HOLD_REASON:-held}" >"$hold_file"
 	printf 'held #%s (%s): %s\n  %s\n' "$HOLD_NUMBER" "$branch" "${HOLD_REASON:-held}" "$hold_file"
@@ -675,7 +680,7 @@ cmd_unhold() {
 	parse_hold_args unhold "$@"
 	local branch hold_file
 	branch="$(plan_branch_for "$HOLD_PLAN" "$HOLD_NUMBER")"
-	hold_file="$(review_hold_file "$HOLD_DIR" "$HOLD_NUMBER" "$branch")"
+	hold_file="$(review_hold_file "$HOLD_DIR" "$branch")"
 	if [[ -f "$hold_file" ]]; then
 		rm -f -- "$hold_file"
 		printf 'released #%s (%s)\n' "$HOLD_NUMBER" "$branch"
@@ -689,7 +694,7 @@ cmd_holds() {
 	parse_plan_file --strict "$HOLD_PLAN"
 	local i reason count=0
 	for i in "${!PLAN_NUMBERS[@]}"; do
-		reason="$(read_hold "$(review_hold_file "$HOLD_DIR" "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}")")"
+		reason="$(read_hold "$(review_hold_file "$HOLD_DIR" "${PLAN_BRANCHES[$i]}")")"
 		[[ -n "$reason" ]] || continue
 		count=$((count + 1))
 		printf '  #%-5s %s\n         %s\n' "${PLAN_NUMBERS[$i]}" "${PLAN_BRANCHES[$i]}" "$reason"
@@ -910,10 +915,11 @@ unresolved_label() {
 	fi
 }
 
-# local_review_blocker <pr-number> <branch> <reviews-dir>
+# local_review_blocker <branch> <reviews-dir>
 #
 # Prints why the local review does not clear this PR for merging, or nothing
-# when the newest run said "true". Only the latest run counts: an older pass
+# when the newest run said "true". The review is looked up by the PR's branch
+# (see lib/review.sh). Only the latest run counts: an older pass
 # describes code that has since been rewritten, and re-reviewing is exactly
 # what a new run is for.
 #
@@ -922,9 +928,9 @@ unresolved_label() {
 # readiness wait — running the review in another terminal releases the train
 # without restarting it.
 local_review_blocker() {
-	local number="$1" branch="$2" dir="$3"
+	local branch="$1" dir="$2"
 	local verdict_file value
-	verdict_file="$(review_verdict_file "$dir" "$number" "$branch")"
+	verdict_file="$(review_verdict_file "$dir" "$branch")"
 
 	if [[ ! -f "$verdict_file" ]]; then
 		printf 'no local review verdict yet (expected %s)' "$verdict_file"
@@ -942,28 +948,28 @@ local_review_blocker() {
 	esac
 }
 
-# hold_blocker <pr-number> <branch> <reviews-dir>
+# hold_blocker <branch> <reviews-dir>
 #
 # Prints why the hold file does not clear this PR for merging — its reason and
 # where the file is — or nothing when there is no hold.
 hold_blocker() {
-	local number="$1" branch="$2" dir="$3"
+	local branch="$1" dir="$2"
 	local hold_file reason
-	hold_file="$(review_hold_file "$dir" "$number" "$branch")"
+	hold_file="$(review_hold_file "$dir" "$branch")"
 	reason="$(read_hold "$hold_file")"
 	[[ -n "$reason" ]] || return 0
 	printf 'held — %s (%s)' "$reason" "$hold_file"
 }
 
-# local_review_label <pr-number> <branch> <reviews-dir>
+# local_review_label <branch> <reviews-dir>
 #
 # The column form of local_review_blocker, for the same reason review_label is
 # the column form of approval_blocker: a path-carrying sentence is what you
 # want when a wait is stuck on you, and unreadable as a table cell.
 local_review_label() {
-	local number="$1" branch="$2" dir="$3"
+	local branch="$1" dir="$2"
 	local verdict
-	verdict="$(read_verdict "$(review_verdict_file "$dir" "$number" "$branch")")"
+	verdict="$(read_verdict "$(review_verdict_file "$dir" "$branch")")"
 	case "$verdict" in
 	true) printf 'ready' ;;
 	false) printf 'not ready' ;;
@@ -972,13 +978,13 @@ local_review_label() {
 	esac
 }
 
-# hold_label <pr-number> <branch> <reviews-dir>
+# hold_label <branch> <reviews-dir>
 #
 # The column form of hold_blocker: "held" or "-". The reason stays out of the
 # table — it is a sentence; `holds` lists it.
 hold_label() {
-	local number="$1" branch="$2" dir="$3"
-	if [[ -n "$(read_hold "$(review_hold_file "$dir" "$number" "$branch")")" ]]; then
+	local branch="$1" dir="$2"
+	if [[ -n "$(read_hold "$(review_hold_file "$dir" "$branch")")" ]]; then
 		printf 'held'
 	else
 		printf -- '-'
@@ -1333,7 +1339,7 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 			"$allow_unresolved" -eq 1 ]]; then
 			# Every wait is switched off — except a hold, which no flag skips.
 			local held
-			held="$(hold_blocker "$number" "$branch" "$local_reviews_dir")"
+			held="$(hold_blocker "$branch" "$local_reviews_dir")"
 			[[ -z "$held" ]] || die_resumable "PR #$number is not ready to merge: $held" \
 				"Run: $0 unhold $plan_file $number — then re-run."
 			step "Skipping the approval, conversation, local review and CI waits (--skip-approval --allow-unresolved --no-require-local-review --skip-ci)"
@@ -1376,10 +1382,10 @@ someone else. Retry with a classic PAT (repo scope) or an OAuth login:
 				# Letting one gate short-circuit another would hide whichever
 				# came second and turn a two-item fix list into two round trips.
 				local blockers=() local_blocker="" hold="" approval="" conversations=""
-				hold="$(hold_blocker "$number" "$branch" "$local_reviews_dir")"
+				hold="$(hold_blocker "$branch" "$local_reviews_dir")"
 				[[ -z "$hold" ]] || blockers+=("$hold")
 				if [[ "$require_local_review" -eq 1 ]]; then
-					local_blocker="$(local_review_blocker "$number" "$branch" "$local_reviews_dir")"
+					local_blocker="$(local_review_blocker "$branch" "$local_reviews_dir")"
 				fi
 				[[ -z "$local_blocker" ]] || blockers+=("local review: $local_blocker")
 				if [[ "$allow_unresolved" -eq 0 ]]; then
