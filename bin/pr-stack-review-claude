@@ -399,11 +399,13 @@ Options (all review commands):
   --force              re-review branches whose latest run already decided,
                        as a new numbered run beside the old one
   --resume             continue an interrupted run instead of starting over:
-                       when a branch's newest run has a session id but never
-                       reached a verdict, pick that Claude Code session up
-                       where it stopped, in the same run directory, with the
-                       transcript appended. Runs that finished are not
-                       resumable, and --force wins if both are given.
+                       when a branch's newest run began its session but
+                       never reached a verdict, pick that Claude Code session
+                       up where it stopped, in the same run directory, with
+                       the transcript appended. Runs that finished are not
+                       resumable, and neither is one stopped before its
+                       session began: that one is started over as a fresh
+                       run. --force wins if both are given.
   --no-restore         stay on the last reviewed branch instead of going
                        back to the branch that was checked out at the start
   --dry-run            print what would be reviewed against what, and the
@@ -668,9 +670,10 @@ plan_run_dir() {
 # new_session_id
 #
 # A UUID for `claude --session-id`. The id is chosen here, before the run
-# starts, rather than read back from the transcript afterwards: a review that
-# dies early — the very case resuming exists for — may never have emitted the
-# system/init event that carries it.
+# starts, rather than read back from the transcript afterwards, so the run
+# directory says which session is its own from its first moment. An id on
+# file is therefore not a session that exists: claude may be stopped before
+# it has opened one (see run_session_started).
 new_session_id() {
 	if [[ -r /proc/sys/kernel/random/uuid ]]; then
 		cat /proc/sys/kernel/random/uuid
@@ -681,22 +684,43 @@ new_session_id() {
 	fi
 }
 
+# run_session_started <run-dir>
+#
+# True when the run's Claude Code session came into being: the run has a
+# session id, and its transcript holds the system/init event claude emits as
+# it opens a session.
+#
+# The id alone does not say so. It is written before claude starts, and a run
+# stopped while claude was still starting up — a Ctrl-C in the first second —
+# leaves the id on file with no session behind it. `claude --resume` on such
+# an id fails with "No conversation found", which would turn a stop into a
+# failed review: under --keep-going the train would record it as failed and
+# never come back to it.
+run_session_started() {
+	local dir="$1"
+	[[ -s "$dir/session-id" && -f "$dir/output.jsonl" ]] || return 1
+	grep -q -F '"subtype":"init"' "$dir/output.jsonl"
+}
+
 # find_resumable_run
 #
 # Points the file globals at the branch's newest run when that run was cut
-# short and can be picked up again: it has a session id, and it never reached a
-# verdict. Returns nonzero when there is nothing to resume, leaving the globals
-# where set_review_paths left them.
+# short and can be picked up again: its session had begun (see
+# run_session_started), and it never reached a verdict. Returns nonzero when
+# there is nothing to resume, leaving the globals where set_review_paths left
+# them.
 #
 # An interrupted run is exactly the one worth continuing rather than repeating:
 # the transcript holds however far the review got, and Claude Code keeps the
 # session, so resuming carries the reasoning over instead of paying for it
 # twice. A finished run is never resumable — it has its verdict, and asking for
-# another opinion is a new run.
+# another opinion is a new run. Neither is a run stopped before its session
+# began: there is no reasoning to carry over, and the review starts again as a
+# fresh numbered run beside it.
 find_resumable_run() {
 	[[ -L "$REVIEW_LATEST" || -d "$REVIEW_LATEST" ]] || return 1
 	local candidate="$REVIEW_LATEST"
-	[[ -s "$candidate/session-id" ]] || return 1
+	run_session_started "$candidate" || return 1
 	local verdict
 	verdict="$(read_verdict "$candidate/verdict")"
 	[[ "$verdict" != "true" && "$verdict" != "false" ]] || return 1
@@ -1136,6 +1160,11 @@ run_review() {
 	if [[ "$resume" -eq 1 ]] && find_resumable_run; then
 		resuming=1
 	else
+		# An undecided newest run that was to be resumed and cannot be: the
+		# only way that happens is that its session never began.
+		if [[ "$resume" -eq 1 && -s "$REVIEW_SESSION" ]] && ! review_is_done "$REVIEW_VERDICT"; then
+			note "the run in $REVIEW_DIR/ was stopped before its session began: nothing to resume, starting a fresh run"
+		fi
 		plan_run_dir 0
 	fi
 
@@ -1235,7 +1264,9 @@ run_review() {
 	# interrupted review is reaped like any other.
 	[[ -z "$scope" ]] || stop_scope "$scope"
 	# An interrupt that cut the review short is not a failure: the run keeps
-	# its session id and no verdict, which is exactly what --resume looks for.
+	# its session and no verdict, which is exactly what --resume looks for
+	# (one that landed before the session began leaves nothing to resume, and
+	# the next run starts fresh).
 	# One that arrived as claude was writing its last file changed nothing —
 	# the run decided, and is judged below like any other. The signal does end
 	# tee and the formatter on the spot, so the pipeline's status says nothing
@@ -1247,7 +1278,11 @@ run_review() {
 	if [[ -n "$INTERRUPTED" ]]; then
 		if ! review_is_done "$REVIEW_VERDICT"; then
 			printf '\n%sInterrupted (%s) during %s.%s\n' "$BOLD" "$INTERRUPTED" "$branch" "$RESET" >&2
-			note "run kept in $REVIEW_DIR/; --resume continues its session, --force starts a fresh run"
+			if run_session_started "$REVIEW_DIR"; then
+				note "run kept in $REVIEW_DIR/; --resume continues its session, --force starts a fresh run"
+			else
+				note "run kept in $REVIEW_DIR/; it was stopped before its session began, so the next run starts fresh"
+			fi
 			return "$(interrupt_status)"
 		fi
 		# The verdict is the completion marker; it, not a dead tee, says how
@@ -1753,12 +1788,13 @@ cmd_status() {
 		runs="$(count_runs)"
 		if review_is_done "$REVIEW_VERDICT"; then
 			state="$verdict"
-		elif [[ -s "$REVIEW_LATEST/session-id" ]]; then
+		elif run_session_started "$REVIEW_LATEST"; then
 			# Started and never finished: --resume can pick this one up.
 			state="resumable"
 			pending=$((pending + 1))
 		else
-			# Missing and malformed alike: review-all will pick it up again.
+			# Missing, malformed, and stopped before its session began alike:
+			# review-all will pick it up again.
 			state="${verdict:-pending}"
 			pending=$((pending + 1))
 		fi
