@@ -28,7 +28,8 @@
 #
 # What a branch holds is not fixed: between two runs it may have been split,
 # reordered or joined with another, so the runs under one slug are not
-# assumed to cover the same commits.
+# assumed to cover the same commits. Each run records what it covered in its
+# own "range" file (the reviewer's business; the gate reads only the verdict).
 #
 # The hold is not part of the review: it only shares the branch's directory.
 # It is the operator's "not this one yet", for any reason at all, and a gate

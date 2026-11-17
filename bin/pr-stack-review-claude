@@ -45,12 +45,19 @@
 # What a branch holds is not fixed. Between two runs it may have been split
 # in two, reordered, or joined with another branch, so the runs under one
 # directory are not assumed to cover the same commits, and a re-review
-# reviews whatever the branch is now against whatever its parent is now.
+# reviews whatever the branch is now against whatever its parent is now. What
+# a given run covered is in its "range" file.
 #
 # The symlink moves when a run starts rather than when it finishes, so
 # latest/output.jsonl can be tailed live. Each run directory holds these
 # fixed-name files:
 #
+#   range        what this run covered: the base it was reviewed against (the
+#                ref and its commit) on the first line, then every commit
+#                under review, one "<hash>  <subject>" per line, oldest
+#                first. Written when the run starts. Nothing reads it back:
+#                it is there so a round can be matched to the change it was
+#                about after the branch has moved on;
 #   output.jsonl the full conversation as stream-json: one event per thinking
 #                block, tool call, tool result, and the closing usage tally —
 #                the record of how the review reached its conclusion;
@@ -339,8 +346,8 @@ Options (all review commands):
   --output-dir <dir>   where the per-branch review directories go
                        (default: <repo-root>/.reviews). Each holds one
                        numbered directory per run (001, 002, …) plus a
-                       "latest" symlink; a run holds output.jsonl, debug.log,
-                       review.md and verdict.
+                       "latest" symlink; a run holds range, output.jsonl,
+                       debug.log, review.md and verdict.
   --prompt-file <path> prompt template (default: share/prompts/code-review.md
                        under this script's prefix)
   --model <name>       passed to claude --model; required, there is no
@@ -517,6 +524,7 @@ stack_index_of() {
 REVIEW_ROOT=""
 REVIEW_LATEST=""
 REVIEW_DIR=""
+REVIEW_RANGE=""
 REVIEW_OUTPUT=""
 REVIEW_DEBUG=""
 REVIEW_MD=""
@@ -528,6 +536,7 @@ REVIEW_SESSION=""
 # Points the file globals at one run directory.
 set_run_files() {
 	REVIEW_DIR="$1"
+	REVIEW_RANGE="$REVIEW_DIR/range"
 	REVIEW_OUTPUT="$REVIEW_DIR/output.jsonl"
 	REVIEW_DEBUG="$REVIEW_DIR/debug.log"
 	REVIEW_MD="$REVIEW_DIR/review.md"
@@ -548,6 +557,20 @@ set_review_paths() {
 	REVIEW_ROOT="$(review_root "$dir" "$branch")"
 	REVIEW_LATEST="$(review_latest_dir "$dir" "$branch")"
 	set_run_files "$REVIEW_LATEST"
+}
+
+# write_range_file <base> <branch>
+#
+# Records what the run covers (see the header): the base ref with the commit
+# it stood at, then the commits under review, oldest first. The branch's
+# contents are free to change between runs, so this is what later says which
+# change a given run was about.
+write_range_file() {
+	local base="$1" branch="$2"
+	{
+		printf 'base: %s @ %s\n' "$base" "$(git rev-parse --verify "$base^{commit}")"
+		git log --reverse --format='%H  %s' "$base..$branch"
+	} >"$REVIEW_RANGE"
 }
 
 # plan_run_dir <create>
@@ -1080,6 +1103,7 @@ run_review() {
 		session_id="$(<"$REVIEW_SESSION")"
 	else
 		plan_run_dir 1
+		write_range_file "$base" "$branch"
 		session_id="$(new_session_id)"
 		printf '%s' "$session_id" >"$REVIEW_SESSION"
 	fi
