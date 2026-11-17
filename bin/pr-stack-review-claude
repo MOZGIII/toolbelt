@@ -18,14 +18,14 @@
 # base: in a chained stack every PR sits on the previous PR's branch, so
 # reviewing against the base would re-review everything underneath it. With a
 # remap file (--remap-file, the file `pr-stack remap` reads) the parent is
-# derived from git, never from the order of the file's lines: every entry is
-# matched to its commit in <base>..<stack head>, and a branch's parent is the
-# listed branch on the nearest earlier commit — or the base (--base) when
-# nothing listed lies below it. Entries commented out as merged are not read:
-# what has landed is in the base by then. The run refuses to start unless
-# every listed branch sits on its matched commit, the same rule as
-# `pr-stack remap --check`: a branch left behind by a rebase would otherwise
-# be reviewed as something it no longer is.
+# derived from git, never from the order of the file's lines: a branch's
+# parent is the listed branch whose tip is its nearest ancestor — or the base
+# (--base) when nothing listed lies below it. Entries commented out as merged
+# are not read: what has landed is in the base by then. The run refuses to
+# start unless every listed branch sits on the commit its pattern matches in
+# <base>..<stack head>, the same rule as `pr-stack remap --check`: a branch
+# left behind by a rebase would otherwise be reviewed as something it no
+# longer is.
 #
 # Without a remap file, `review` takes the branch as the whole stack and
 # reviews it against --base. That is the same review in every other respect —
@@ -286,8 +286,8 @@ Commands:
         review is filed under the branch, and the merge gate finds it
         there once a PR exists.
         With --remap-file the branch must be listed in the file, and its
-        parent is the listed branch on the nearest earlier commit of the
-        stack (the base when none lies below it). Without it the branch
+        parent is the listed branch whose tip is its nearest ancestor
+        (the base when none lies below it). Without it the branch
         is reviewed against --base directly. Either way it is the same
         review, filed in the same place.
 
@@ -404,39 +404,33 @@ EOF
 #
 # The remap file's format and the matching of its patterns to commits live in
 # lib/remap.sh, shared with pr-stack. What is local to reviewing is the
-# reading of the result as a stack: which branch lies below which.
+# reading of the listed branches as a stack — which branch lies below which —
+# and the check that the stack is where the remap file says it is.
 # ---------------------------------------------------------------------------
 
-# The remap file's entries in stack order, bottom first, parallel to each
-# other: the branch, the branch it is reviewed against, and the subject of the
-# commit it sits on. Filled by load_stack.
+# The remap file's branches in stack order, bottom first, parallel to each
+# other: the branch, the branch it is reviewed against, and the subject of its
+# tip commit. Filled by load_stack.
 STACK_BRANCHES=()
 STACK_PARENTS=()
 STACK_TITLES=()
 
-# load_stack <remap-file> <base> <stack-head>
+# check_remap <remap-file> <base> <stack-head>
 #
-# Matches every entry of the remap file to its commit in <base>..<stack-head>
-# and orders the entries by where their commits lie, which is what makes the
-# order of the file's lines irrelevant. An entry's parent is the listed branch
-# on the nearest strictly earlier commit, or <base> when there is none; two
-# branches listed on one commit share a parent and neither is the other's.
+# The `pr-stack remap --check` rule, over the remap file parse_remap_file has
+# just read: every pattern matches one commit in <base>..<stack-head>, and
+# every listed branch sits on its matched commit. Dies otherwise.
 #
-# Every listed branch has to sit on its matched commit already. The review
-# checks the branch out, so a branch a rebase left behind would be reviewed as
-# the commits it used to hold, against a parent that has moved away from under
-# it. Moving branches is pr-stack's job, not this script's, so this stops and
-# says which ones are off.
-#
-# A branch listed twice is one entry: there is one review per branch.
-load_stack() {
+# This is what keeps a stack that was rebased and not remapped from being
+# reviewed. The review checks each branch out, so a branch the rebase left
+# behind would be reviewed as the commits it used to hold. Moving branches is
+# pr-stack's job, not this script's, so this stops and says which ones are
+# off.
+check_remap() {
 	local remap_file="$1" base="$2" head="$3"
-	git rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
-		die "base ref does not resolve: $base"
 	git rev-parse --verify --quiet "$head^{commit}" >/dev/null ||
 		die "stack head does not resolve: $head"
 
-	parse_remap_file "$remap_file"
 	resolve_remap_commits "$base" "$head" ||
 		die "$remap_file does not match $base..$head (see above); nothing is reviewed"
 
@@ -456,42 +450,89 @@ load_stack() {
 		printf '         %s\n' "${stale[@]}" >&2
 		die "nothing is reviewed until they are (pr-stack remap moves them)"
 	fi
+}
 
-	# Where each commit of the range lies, counted from the bottom.
-	local -A position=()
-	local hash n=0
-	while IFS= read -r hash; do
-		n=$((n + 1))
-		position["$hash"]="$n"
-	done < <(git rev-list --reverse "$base..$head")
+# load_stack <remap-file> <base> <stack-head>
+#
+# Reads the remap file's branches as a stack, once the remap check against
+# <stack-head> has passed (check_remap).
+#
+# The stack itself comes from the branches' own tips: an entry's parent is
+# the listed branch whose tip is its nearest strict ancestor, or <base> when
+# no listed branch lies below it, and the entries are ordered bottom first by
+# how many commits each has on top of <base>. Neither depends on the order of
+# the file's lines. Two branches listed on one commit share a parent and
+# neither is the other's.
+#
+# Every listed branch has to exist and hold commits on top of <base>: one
+# that does not has nothing to review, and finding that out here costs less
+# than finding it out halfway through a train.
+#
+# A branch listed twice is one entry: there is one review per branch.
+load_stack() {
+	local remap_file="$1" base="$2" head="$3"
+	git rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
+		die "base ref does not resolve: $base"
 
-	# "<position> <index>" per entry, sorted bottom first; entries on one
-	# commit keep the order the file lists them in.
+	parse_remap_file "$remap_file"
+	check_remap "$remap_file" "$base" "$head"
+
 	local -A seen=()
-	local order=""
+	local -a branches=() unusable=()
+	local i branch base_commit
+	base_commit="$(git rev-parse --verify "$base^{commit}")"
 	for i in "${!REMAP_BRANCHES[@]}"; do
 		branch="${REMAP_BRANCHES[$i]}"
 		[[ -z "${seen[$branch]:-}" ]] || continue
 		seen["$branch"]=1
-		order+="${position[${REMAP_HASHES[$i]}]} $i"$'\n'
+		if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+			unusable+=("$branch: missing locally")
+		elif ! git merge-base --is-ancestor "$base_commit" "refs/heads/$branch"; then
+			unusable+=("$branch: does not sit on top of $base")
+		elif [[ "$(git rev-parse "refs/heads/$branch")" == "$base_commit" ]]; then
+			unusable+=("$branch: has no commits on top of $base")
+		else
+			branches+=("$branch")
+		fi
+	done
+	if [[ ${#unusable[@]} -gt 0 ]]; then
+		printf 'error: %d branch(es) of %s cannot be reviewed against %s:\n' \
+			"${#unusable[@]}" "$remap_file" "$base" >&2
+		printf '         %s\n' "${unusable[@]}" >&2
+		die "nothing is reviewed: every listed branch has to exist and hold commits on top of $base"
+	fi
+
+	# "<commits on top of base> <index>" per branch, sorted bottom first;
+	# branches the same distance up keep the order the file lists them in.
+	local order=""
+	for i in "${!branches[@]}"; do
+		order+="$(git rev-list --count "$base_commit..refs/heads/${branches[$i]}") $i"$'\n'
 	done
 
 	STACK_BRANCHES=()
 	STACK_PARENTS=()
 	STACK_TITLES=()
-	local pos last_pos=0 parent="$base" below="$base"
-	while read -r pos i; do
-		[[ -n "$pos" ]] || continue
-		if [[ "$pos" -ne "$last_pos" ]]; then
-			# A new commit: everything recorded so far lies below it, and the
-			# nearest of that is the entry recorded last.
-			parent="$below"
-			last_pos="$pos"
-		fi
-		STACK_BRANCHES+=("${REMAP_BRANCHES[$i]}")
+	# Parallel to STACK_BRANCHES: how many commits each has on top of the base.
+	local -a heights=()
+	local height j parent
+	while read -r height i; do
+		[[ -n "$height" ]] || continue
+		branch="${branches[$i]}"
+		# The nearest listed ancestor is the highest one, so the entries
+		# recorded so far are tried from the top down and the first ancestor
+		# found is the parent. An entry the same height up cannot be one.
+		parent="$base"
+		for ((j = ${#STACK_BRANCHES[@]} - 1; j >= 0; j--)); do
+			[[ "${heights[$j]}" -lt "$height" ]] || continue
+			if git merge-base --is-ancestor "refs/heads/${STACK_BRANCHES[$j]}" "refs/heads/$branch"; then
+				parent="${STACK_BRANCHES[$j]}"
+				break
+			fi
+		done
+		STACK_BRANCHES+=("$branch")
 		STACK_PARENTS+=("$parent")
-		STACK_TITLES+=("${REMAP_SUBJECTS[$i]}")
-		below="${REMAP_BRANCHES[$i]}"
+		STACK_TITLES+=("$(git log -1 --format=%s "refs/heads/$branch")")
+		heights+=("$height")
 	done < <(printf '%s' "$order" | sort -n -k1,1 -k2,2)
 }
 
