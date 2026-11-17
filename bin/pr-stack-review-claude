@@ -1057,6 +1057,11 @@ run_review() {
 		die "branch not found locally: $branch"
 	git rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
 		die "base ref does not resolve: $base"
+	# The review reads `git diff <base>..<branch>` as the change. That is the
+	# change only when the branch sits on top of the base; otherwise it also
+	# shows, reversed, everything the base has that the branch does not.
+	git merge-base --is-ancestor "$base" "$branch" ||
+		die "$base is not an ancestor of $branch: the branch has to sit on top of what it is reviewed against"
 
 	# Every review is a fresh numbered run; earlier ones are never overwritten,
 	# so a re-review can be compared against what it supersedes. The prompt has
@@ -1082,6 +1087,8 @@ run_review() {
 
 	local commits
 	commits="$(git rev-list --count "$base..$branch")"
+	[[ "$commits" -gt 0 ]] ||
+		die "nothing to review: $branch has no commits on top of $base"
 	note "range  $base..$branch ($commits commit(s))"
 	if [[ "$resuming" -eq 1 ]]; then
 		note "resume $REVIEW_DIR/ (session $(<"$REVIEW_SESSION"))"
